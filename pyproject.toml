@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sheetsage2-refined"
+version = "0.1.0"
+description = "Beats, downbeats and meters, melody, detailed chords and keys of whole songs with a fine-tuned SheetSage2"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "anime-song" }]
+keywords = ["music transcription", "beat tracking", "downbeat", "time signature", "chord recognition", "key detection", "melody"]
+dependencies = [
+    "torch>=2.8",
+    "torchaudio>=2.8",
+    "numpy",
+    "safetensors>=0.4",
+    "soundfile>=0.12",
+    "huggingface_hub[hf_xet]>=0.30",
+]
+
+[project.urls]
+"Model" = "https://huggingface.co/anime-song/SheetSage2-Refined"
+"Source" = "https://github.com/anime-song/SheetSage2-Refined"
+
+[project.scripts]
+sheetsage2-refined = "sheetsage2_refined.__main__:main"
+
+[tool.setuptools]
+packages = ["sheetsage2_refined"]
+
+[tool.setuptools.package-data]
+sheetsage2_refined = ["visualize.html"]
