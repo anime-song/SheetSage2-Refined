@@ -6,7 +6,11 @@ frame, the chord's ``root`` / ``bass`` (12 + N) and ``tones`` (12), the ``key`` 
 major / minor), where the chord, the key, the beat, the bar or a beat group starts (``BINARY``),
 and, for a head trained with bars (``BAR``), facts about the bar the frame lies in: its beats, the
 beats left until the next bar head and its groups.  Heads are trained by ``training/train_heads.py``.
+A head with ``offset`` also says where the beat and the bar head lie within their 40 ms frame (``OFFSETS``, in
+frames from the frame centre), for beat times finer than the frame grid.  A head with ``unit`` also predicts the
+denominator of the bar the frame lies in (``bar_unit`` over ``UNITS``).
 
+* ``beats.HeadBeats`` tracks beats, bars and meters from a bar head alone (no decoder).
 * ``BarFeatures`` adds a projection of a pair of bar heads' bar facts to the decoder memory (the
   decoder was trained with this input).
 * ``transcribe_many(rescoring=...)`` rescores the decoder's tokens with heads' predictions
@@ -30,17 +34,22 @@ DISTILL = 256  # width of the teacher's chord-head hidden vector (data_tools.tsu
 BINARY = ("chord_boundary", "key_boundary", "beat", "downbeat", "group")
 BAR = {"bar_beats": 16, "beats_left": 16, "bar_groups": 8}  # classes of the bar outputs
 BAR_FEATURES = sum(BAR.values()) + 3  # bar facts + beat, downbeat, group
+OFFSETS = ("beat_offset", "downbeat_offset")  # where the beat lies from the frame centre, in frames (optional)
+UNITS = (2, 4, 8, 16)  # a meter's denominator: classes of the optional ``bar_unit`` output
 CHUNK = (1500, 375)  # GRU on 60 s pieces with 15 s context either side (the heads learnt from 60-90 s crops)
 
 
 class FrameHead(nn.Module):
     def __init__(
         self, states: int = 25, width: int = 1024, hidden: int = 384, binary: int = len(BINARY), bar: bool = False,
-        mixes: int = 1, rnn_layers: int = 2, detail: bool = False, distill: bool = False,
+        mixes: int = 1, rnn_layers: int = 2, detail: bool = False, distill: bool = False, offset: bool = False,
+        unit: bool = False,
     ):  # fmt: skip
         super().__init__()
         self.binary_names = BINARY[:binary]
         self.bar = nn.Linear(hidden, sum(BAR.values())) if bar else None
+        self.offset = nn.Linear(hidden, len(OFFSETS)) if offset else None
+        self.unit = nn.Linear(hidden, len(UNITS)) if unit else None  # the bar's denominator
         if mixes == 1:
             self.mix = nn.Parameter(torch.zeros(states))
         else:  # mix k starts out leaning towards its own depth (low, ..., high blocks)
@@ -80,6 +89,11 @@ class FrameHead(nn.Module):
         out |= {name: binary[..., i] for i, name in enumerate(self.binary_names)}
         if self.bar is not None:
             out |= dict(zip(BAR, self.bar(x).split(list(BAR.values()), dim=-1)))
+        if self.unit is not None:
+            out["bar_unit"] = self.unit(x)
+        if self.offset is not None:
+            offsets = self.offset(x)
+            out |= {name: offsets[..., i] for i, name in enumerate(OFFSETS)}
         return out
 
     def _rnn_chunked(self, x: Tensor, core: int, context: int) -> Tensor:
@@ -107,7 +121,8 @@ def load_head(path: Path, device="cpu") -> FrameHead:
     layers = sum(1 for k in state if k.startswith("rnn.weight_ih_l") and not k.endswith("_reverse"))
     head = FrameHead(
         hidden=state["inp.weight"].shape[0], binary=binary, bar="bar.weight" in state, mixes=mixes, rnn_layers=layers,
-        detail="detail.weight" in state, distill="distill.weight" in state,
+        detail="detail.weight" in state, distill="distill.weight" in state, offset="offset.weight" in state,
+        unit="unit.weight" in state,
     ).to(device).eval()
     head.load_state_dict(state, strict=not {"key.weight"} - set(state))
     head.requires_grad_(False)
@@ -128,7 +143,9 @@ class HeadMean(nn.Module):
         outs = [head(states, chunk) for head in self.heads]
         mean = {}
         for name in outs[0]:
-            if name in self.SIGMOID:
+            if name in OFFSETS:
+                mean[name] = sum(o[name].float() for o in outs) / len(outs)
+            elif name in self.SIGMOID:
                 p = sum(torch.sigmoid(o[name].float()) for o in outs) / len(outs)
                 mean[name] = torch.logit(p.clamp(1e-6, 1 - 1e-6))
             else:

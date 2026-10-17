@@ -46,14 +46,15 @@ def weight_files(config: dict) -> list[str]:
 
     bar = config.get("bar_features") or {}
     names = [config["base_weights"], config.get("decoder"), bar.get("projection"), *bar.get("heads", [])]
+    names.append((config.get("beat_tracker") or {}).get("head"))
     for spec in config.get("rescoring", {}).values():
         names.extend(spec["head"] if isinstance(spec["head"], list) else [spec["head"]])
     return sorted({name for name in names if name})
 
 
-def model_folder(model: Path | str, revision: str | None = None) -> Path:
+def model_folder(model: Path | str, revision: str | None = None, files=weight_files) -> Path:
     """A local model folder as it is, or a Hugging Face model repo downloaded into the Hub cache
-    (only ``config.json`` and the files it names)."""
+    (only ``config.json`` and the files ``files(config)`` names: by default every file it names)."""
 
     if Path(model).is_dir():
         return Path(model)
@@ -62,7 +63,7 @@ def model_folder(model: Path | str, revision: str | None = None) -> Path:
     from huggingface_hub import hf_hub_download, snapshot_download
 
     config = json.loads(Path(hf_hub_download(str(model), "config.json", revision=revision)).read_text(encoding="utf-8"))
-    return Path(snapshot_download(str(model), revision=revision, allow_patterns=["config.json", *weight_files(config)]))
+    return Path(snapshot_download(str(model), revision=revision, allow_patterns=["config.json", *files(config)]))
 
 
 def mode_bias(tau: float, counts: list[float] | None) -> list[float] | None:

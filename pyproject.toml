@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sheetsage2-refined"
-version = "0.1.0"
+version = "0.2.0"
 description = "Beats, downbeats and meters, melody, detailed chords and keys of whole songs with a fine-tuned SheetSage2"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,7 @@ dependencies = [
     "torch>=2.8",
     "torchaudio>=2.8",
     "numpy",
+    "numba>=0.60",
     "safetensors>=0.4",
     "soundfile>=0.12",
     "huggingface_hub[hf_xet]>=0.30",
