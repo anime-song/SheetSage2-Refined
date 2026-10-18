@@ -14,17 +14,18 @@ A fine-tuned [SheetSage2](https://huggingface.co/m-a-p/SheetSage2); details and 
 ## Results
 
 SheetSage2 against SheetSage2-Refined on the same held-out songs; the largest gains are on bars and time
-signatures. The beat tracker without the decoder ([below](#beats-downbeats-and-time-signatures-only-no-decoder))
-gives beats and bars only. The evaluation sets and all scores are on the [model card](https://huggingface.co/anime-song/SheetSage2-Refined#results).
+signatures. The last column is the decoder-free heads: the beat tracker
+([below](#beats-downbeats-and-time-signatures-only-no-decoder)) for beats and bars, the melody head
+([below](#melody-only-no-decoder)) for the melody. The evaluation sets and all scores are on the [model card](https://huggingface.co/anime-song/SheetSage2-Refined#results).
 
 <!-- tables:summary -->
-|  | SheetSage2 | SheetSage2-Refined | Beat tracker (no decoder) |
+|  | SheetSage2 | SheetSage2-Refined | No decoder (beat / melody heads) |
 |---|---|---|---|
 | Downbeat F, pop songs (mostly 4/4) | 0.966 | 0.965 | **0.976** |
 | Downbeat F, odd-meter songs | 0.733 | 0.835 | **0.883** |
 | Chords (tetrads), pop songs | 0.678 | **0.770** | — |
 | Key, pop songs | 0.840 | **0.920** | — |
-| Melody F, HookTheory | 0.664 | **0.682** | — |
+| Melody F, HookTheory | 0.664 | 0.682 | **0.713** |
 <!-- /tables:summary -->
 
 Bars whose two barlines are both found (±70 ms), by time signature, on 50 songs with odd meters and meter changes:
@@ -92,6 +93,26 @@ result["bars"]                          # [{"start": 1.42, "beats": 7, "unit": 8
 
 Each bar's denominator is chosen so that the written tempo does not jump: the same beat keeps its denominator,
 and a 7-beat bar after 4/4 at twice the beat speed is written 7/8, not 7/4.
+
+### Melody only (no decoder)
+
+A melody head on the same frozen encoder writes the melody without the decoder, in a few seconds per song on a GPU.
+Only SheetSage2's encoder weights and the 8 MB head are downloaded.
+
+```bash
+python -m sheetsage2_refined.melody song.mp3      # -> outputs/melody/song.melody.json
+```
+
+```python
+from sheetsage2_refined.melody import HeadMelody
+
+melody = HeadMelody.load()
+result = melody.transcribe("song.mp3")
+result["notes"]   # [{"start": 12.34, "end": 12.58, "pitch": 67, "track": 0, "steps": 2, "pos": 0}, ...]
+```
+
+`pitch` is the MIDI note (sounding pitch), `track` 0 sung / 1 played, `steps` the note's length in sixteenths and
+`pos` the sixteenth of its beat it starts on. Note times are not placed on the beat grid yet.
 
 ## License
 

@@ -65,6 +65,20 @@ def load_encoder(path: Path, device: str | torch.device = "cpu") -> MERTEncoder:
     return encoder.to(device).eval()
 
 
+@torch.no_grad()
+def frame_outputs(encoder: MERTEncoder, head: FrameHead | HeadMean, wave: torch.Tensor, device: torch.device) -> dict[str, torch.Tensor]:
+    """A head's 25 Hz outputs (logits, ``[frames, ...]`` on the CPU in float32) for a 24 kHz waveform, encoded in
+    windows of ``WINDOW_SECONDS`` at their own length (as the heads were trained)."""
+
+    window = round(WINDOW_SECONDS * encoder.config.sample_rate)
+    outs = []
+    for start in range(0, len(wave), window):
+        with autocast(device):
+            states = encoder(wave[start : start + window][None].to(device))
+        outs.append(head(states, CHUNK))  # the head runs in float32 (its GRU)
+    return {k: torch.cat([o[k] for o in outs], 1)[0].float().cpu() for k in outs[0]}
+
+
 class HeadBeats:
     def __init__(self, encoder: MERTEncoder, head: FrameHead | HeadMean, device: torch.device, tempo_weight: float = 4.0,
                  **options):  # fmt: skip
@@ -96,19 +110,11 @@ class HeadBeats:
         head = loaded[0] if len(loaded) == 1 else HeadMean(loaded).eval()
         return cls(load_encoder(weights, device), head, device, **options)
 
-    @torch.no_grad()
     def probabilities(self, wave: torch.Tensor) -> dict[str, np.ndarray]:
-        """The head's 25 Hz outputs for a 24 kHz waveform, encoded in windows of ``WINDOW_SECONDS`` at their own
-        length (as the heads were trained): beat, downbeat [frames]; bar_beats, beats_left [frames, 16]; and the
-        offsets (frames) and bar_unit [frames, 4] if the head has them."""
+        """The head's 25 Hz outputs for a 24 kHz waveform (``frame_outputs``): beat, downbeat [frames]; bar_beats,
+        beats_left [frames, 16]; and the offsets (frames) and bar_unit [frames, 4] if the head has them."""
 
-        window = round(WINDOW_SECONDS * self.encoder.config.sample_rate)
-        outs = []
-        for start in range(0, len(wave), window):
-            with autocast(self.device):
-                states = self.encoder(wave[start : start + window][None].to(self.device))
-            outs.append(self.head(states, CHUNK))  # the head runs in float32 (its GRU)
-        out = {k: torch.cat([o[k] for o in outs], 1)[0].float() for k in outs[0]}
+        out = frame_outputs(self.encoder, self.head, wave, self.device)
         probs = {k: torch.sigmoid(out[k]).cpu().numpy() for k in ("beat", "downbeat")}
         probs |= {k: torch.softmax(out[k], -1).cpu().numpy() for k in ("bar_beats", "beats_left", "bar_unit") if k in out}
         probs |= {k: out[k].cpu().numpy() for k in OFFSETS if k in out}

@@ -8,9 +8,19 @@ and, for a head trained with bars (``BAR``), facts about the bar the frame lies 
 beats left until the next bar head and its groups.  Heads are trained by ``training/train_heads.py``.
 A head with ``offset`` also says where the beat and the bar head lie within their 40 ms frame (``OFFSETS``, in
 frames from the frame centre), for beat times finer than the frame grid.  A head with ``unit`` also predicts the
-denominator of the bar the frame lies in (``bar_unit`` over ``UNITS``).
+denominator of the bar the frame lies in (``bar_unit`` over ``UNITS``).  A head with ``melody`` transcribes the melody
+(one line, as SheetSage2-Refined writes it: its vocal and instrument tracks almost never sound together): per frame
+and key of ``MELODY_KEYS`` from ``MELODY_LOWEST`` whether a note sounds (``melody``) or starts (``melody_on``), where
+the starting note lies from the frame centre (``melody_offset``, frames) and whether the sounding note is sung
+(``melody_vocal``: track 0) or played (track 1).  A head with ``line`` reads the melody as one line instead: per frame
+the sounding key or a rest (``melody_pitch``, a softmax over the rest and the 88 keys, so one note at a time), whether
+a note starts (``melody_on``, one bit), the offset and the vocal call as above, and facts about the note the frame
+lies in, read on the spot as the bar facts: its length (``note_steps``, 1..16 sixteenths), the sixteenths left until
+it ends (``steps_left``, 1..16) and where in its beat it starts (``onset_pos``, 0..3 sixteenths).  A head with
+``extra`` adds a projection of more per-frame inputs (``BeatInformed``: a beat head's bar facts) to its features.
 
 * ``beats.HeadBeats`` tracks beats, bars and meters from a bar head alone (no decoder).
+* ``melody.HeadMelody`` writes the melody's notes from a melody head alone (no decoder).
 * ``BarFeatures`` adds a projection of a pair of bar heads' bar facts to the decoder memory (the
   decoder was trained with this input).
 * ``transcribe_many(rescoring=...)`` rescores the decoder's tokens with heads' predictions
@@ -36,6 +46,9 @@ BAR = {"bar_beats": 16, "beats_left": 16, "bar_groups": 8}  # classes of the bar
 BAR_FEATURES = sum(BAR.values()) + 3  # bar facts + beat, downbeat, group
 OFFSETS = ("beat_offset", "downbeat_offset")  # where the beat lies from the frame centre, in frames (optional)
 UNITS = (2, 4, 8, 16)  # a meter's denominator: classes of the optional ``bar_unit`` output
+MELODY_LOWEST, MELODY_KEYS = 21, 88  # the melody outputs' keys: MIDI 21 (A0) .. 108 (C8)
+MELODY_SIGMOID = ("melody", "melody_on", "melody_vocal")  # the optional melody outputs read as probabilities
+LINE = {"melody_pitch": 1 + MELODY_KEYS, "note_steps": 16, "steps_left": 16, "onset_pos": 4}  # softmax outputs of ``line``
 CHUNK = (1500, 375)  # GRU on 60 s pieces with 15 s context either side (the heads learnt from 60-90 s crops)
 
 
@@ -43,13 +56,21 @@ class FrameHead(nn.Module):
     def __init__(
         self, states: int = 25, width: int = 1024, hidden: int = 384, binary: int = len(BINARY), bar: bool = False,
         mixes: int = 1, rnn_layers: int = 2, detail: bool = False, distill: bool = False, offset: bool = False,
-        unit: bool = False,
+        unit: bool = False, melody: bool = False, line: bool = False, extra: int = 0,
     ):  # fmt: skip
         super().__init__()
         self.binary_names = BINARY[:binary]
         self.bar = nn.Linear(hidden, sum(BAR.values())) if bar else None
         self.offset = nn.Linear(hidden, len(OFFSETS)) if offset else None
         self.unit = nn.Linear(hidden, len(UNITS)) if unit else None  # the bar's denominator
+        # per key: sounding, starting; then the onset's offset and the vocal logit
+        self.melody = nn.Linear(hidden, 2 * MELODY_KEYS + 2) if melody else None
+        # the line's softmax outputs, then its onset, offset and vocal logits
+        self.line = nn.Linear(hidden, sum(LINE.values()) + 3) if line else None
+        self.extra = nn.Linear(extra, hidden) if extra else None
+        if self.extra is not None:  # starts out as a head without the extra inputs
+            nn.init.zeros_(self.extra.weight)
+            nn.init.zeros_(self.extra.bias)
         if mixes == 1:
             self.mix = nn.Parameter(torch.zeros(states))
         else:  # mix k starts out leaning towards its own depth (low, ..., high blocks)
@@ -68,14 +89,16 @@ class FrameHead(nn.Module):
         self.detail = nn.Linear(hidden, DETAIL) if detail else None  # root x quality (tensions included)
         self.distill = nn.Linear(hidden, DISTILL) if distill else None  # the teacher's hidden vector (training only)
 
-    def forward(self, states: list[Tensor], chunk: tuple[int, int] | None = None) -> dict[str, Tensor]:
-        """Per-frame logits.  With ``chunk=(core, context)`` the GRU runs on pieces of ``core`` frames with
+    def forward(self, states: list[Tensor], chunk: tuple[int, int] | None = None, extra: Tensor | None = None) -> dict[str, Tensor]:
+        """Per-frame logits (``extra`` ``[B, frames, n]``: the inputs of a head with ``extra``).  With ``chunk=(core, context)`` the GRU runs on pieces of ``core`` frames with
         ``context`` frames either side, batched together: a GRU steps through its frames one by one, so a
         12-minute clip in one piece is slow, and the heads learnt from crops of 60-90 s anyway."""
 
         weights = torch.softmax(self.mix, -1).reshape(-1, len(states))
         mixed = [self.norm(sum(w * s.float() for w, s in zip(row, states))) for row in weights]
         x = F.gelu(self.inp(torch.cat(mixed, -1)))
+        if self.extra is not None:
+            x = x + self.extra(extra.to(x.dtype))
         for conv in self.convs:
             x = x + F.gelu(conv(x.transpose(1, 2)).transpose(1, 2))
         x = x.float()  # under autocast a bf16 input sends the GRU down a path ~15x slower than fp32
@@ -94,6 +117,14 @@ class FrameHead(nn.Module):
         if self.offset is not None:
             offsets = self.offset(x)
             out |= {name: offsets[..., i] for i, name in enumerate(OFFSETS)}
+        if self.melody is not None:
+            melody = self.melody(x)
+            out |= {"melody": melody[..., :MELODY_KEYS], "melody_on": melody[..., MELODY_KEYS : 2 * MELODY_KEYS],
+                    "melody_offset": melody[..., -2], "melody_vocal": melody[..., -1]}  # fmt: skip
+        if self.line is not None:
+            line = self.line(x)
+            out |= dict(zip(LINE, line[..., :-3].split(list(LINE.values()), dim=-1)))
+            out |= {"melody_on": line[..., -3], "melody_offset": line[..., -2], "melody_vocal": line[..., -1]}
         return out
 
     def _rnn_chunked(self, x: Tensor, core: int, context: int) -> Tensor:
@@ -122,18 +153,48 @@ def load_head(path: Path, device="cpu") -> FrameHead:
     head = FrameHead(
         hidden=state["inp.weight"].shape[0], binary=binary, bar="bar.weight" in state, mixes=mixes, rnn_layers=layers,
         detail="detail.weight" in state, distill="distill.weight" in state, offset="offset.weight" in state,
-        unit="unit.weight" in state,
+        unit="unit.weight" in state, melody="melody.weight" in state, line="line.weight" in state,
+        extra=state["extra.weight"].shape[1] if "extra.weight" in state else 0,
     ).to(device).eval()
     head.load_state_dict(state, strict=not {"key.weight"} - set(state))
     head.requires_grad_(False)
     return head
 
 
+def bar_facts(out: dict[str, Tensor]) -> Tensor:
+    """``[B, frames, BAR_FEATURES]``: a bar head's bar facts as probabilities (``BarFeatures``)."""
+
+    parts = [torch.softmax(out[name].float(), -1) for name in BAR]
+    parts.append(torch.stack([torch.sigmoid(out[n].float()) for n in ("beat", "downbeat", "group")], -1))
+    return torch.cat(parts, -1)
+
+
+class BeatInformed(nn.Module):
+    """A head with ``extra`` (``BAR_FEATURES``) given a frozen beat head's bar facts on the same encoder states."""
+
+    def __init__(self, beat: nn.Module, head: FrameHead):
+        super().__init__()
+        self.beat, self.head = beat, head
+        self.beat.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.beat.eval()  # frozen: no dropout
+        return self
+
+    def facts(self, states: list[Tensor], chunk: tuple[int, int] | None = None) -> Tensor:
+        with torch.no_grad():
+            return bar_facts(self.beat(states, chunk))
+
+    def forward(self, states: list[Tensor], chunk: tuple[int, int] | None = None) -> dict[str, Tensor]:
+        return self.head(states, chunk, extra=self.facts(states, chunk))
+
+
 class HeadMean(nn.Module):
     """Several heads as one: their per-frame probabilities averaged, returned as logits
     (log-probabilities of the mean for the softmax outputs, the logit of the mean for the sigmoid ones)."""
 
-    SIGMOID = ("tones", *BINARY)
+    SIGMOID = ("tones", *BINARY, *MELODY_SIGMOID)
 
     def __init__(self, heads: list[FrameHead]):
         super().__init__()
@@ -143,7 +204,7 @@ class HeadMean(nn.Module):
         outs = [head(states, chunk) for head in self.heads]
         mean = {}
         for name in outs[0]:
-            if name in OFFSETS:
+            if name in OFFSETS or name == "melody_offset":
                 mean[name] = sum(o[name].float() for o in outs) / len(outs)
             elif name in self.SIGMOID:
                 p = sum(torch.sigmoid(o[name].float()) for o in outs) / len(outs)
@@ -182,10 +243,7 @@ class BarFeatures(nn.Module):
 
     @torch.no_grad()
     def _facts(self, states: list[Tensor], k: int) -> Tensor:
-        out = self.heads[k](states, CHUNK)
-        parts = [torch.softmax(out[name].float(), -1) for name in BAR]
-        parts.append(torch.stack([torch.sigmoid(out[n].float()) for n in ("beat", "downbeat", "group")], -1))
-        return torch.cat(parts, -1)
+        return bar_facts(self.heads[k](states, CHUNK))
 
     @torch.no_grad()
     def probabilities(self, states: list[Tensor], folds: list[int | None] | None = None) -> Tensor:

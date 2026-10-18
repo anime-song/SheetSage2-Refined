@@ -19,6 +19,9 @@
         "downbeat": {"head": ["heads/bar-v5-f0.safetensors", "heads/bar-v5-f1.safetensors"], "weight": 1.0},
         "root": {"head": "heads/chord-v1.safetensors", "weight": 2.0}, ...  # a list of heads: their mean
       },
+      "beat_tracker": {"head": "heads/beat-v7u.safetensors"},  # optional: beats without the decoder (beats.py)
+      "melody_tracker": {"head": "heads/melody-m4.safetensors",  # optional: the melody without the decoder (melody.py)
+                         "decoding": {"onset_weight": 2.0, "start_penalty": 0.5}},
       "prompts": ["timestamp", "downbeat_meter", "structure", "key", "chord_detail", "melody_full"],
       "mode_tau": 0.2,                                     # with the key_mode prompt (see ``mode_bias``)
       "mode_counts": [...]                                 # one per theory.MODES
@@ -47,6 +50,8 @@ def weight_files(config: dict) -> list[str]:
     bar = config.get("bar_features") or {}
     names = [config["base_weights"], config.get("decoder"), bar.get("projection"), *bar.get("heads", [])]
     names.append((config.get("beat_tracker") or {}).get("head"))
+    melody = config.get("melody_tracker") or {}
+    names.extend([melody.get("head"), melody.get("beat_head")])
     for spec in config.get("rescoring", {}).values():
         names.extend(spec["head"] if isinstance(spec["head"], list) else [spec["head"]])
     return sorted({name for name in names if name})
