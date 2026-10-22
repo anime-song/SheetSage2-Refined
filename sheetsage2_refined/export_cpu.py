@@ -20,6 +20,18 @@ kernels read them in, as float16 (default), float32 or int8 with a scale per out
 ``--lora`` merges a LoRA adapter into the encoder before folding (``W += scale * B @ A``), with keys named
 ``<module>.lora_A.weight`` / ``<module>.lora_B.weight`` as PEFT writes them, ``<module>`` an encoder module name such
 as ``layers.3.attn.q`` (an ``encoder.`` or PEFT ``base_model.model.`` prefix is dropped).
+
+``--adapter`` instead writes only the adapter, for the engine to apply at run time next to unchanged base weights
+(``sheetsage2-cpu --adapter``), a few MiB in place of a new 1.2 GiB export:
+
+    python -m sheetsage2_refined.export_cpu out.lora.safetensors --adapter LORA.safetensors [--lora-scale S]
+
+The adapter is folded like the weights it changes: per engine linear layer ``name`` it holds ``name.a`` ``[R, K]``
+(the norm's scale folded in), ``name.b.<row>`` ``[n, r]`` (``scale``, the FFN's 0.5 and q's ``1/sqrt(head_dim)``
+folded in) for outputs ``row .. row + n``, and ``name.db`` ``[N]`` (what the norm's shift and GRN's ``beta`` add
+through the adapter), so the engine adds ``(x a^T) b^T + db`` to the layer's output.  q, k and v share one
+``attn.qkv`` layer: each adapter is one part (``b.0``, ``b.1024``, ``b.2048``), their rows of ``a`` stacked in that
+order.  ``a`` and ``b`` are float16, the way the engine keeps them.
 """
 
 from __future__ import annotations
@@ -43,6 +55,7 @@ from .pipeline import DEFAULT_MODEL, model_folder
 
 PANEL = 16  # output channels per weight panel (the engine's micro-kernel width)
 FORMAT = "sheetsage2-cpu/1"
+ADAPTER_FORMAT = "sheetsage2-cpu-lora/1"
 
 
 def pack(weight: np.ndarray, dtype: str) -> dict[str, np.ndarray]:
@@ -86,24 +99,109 @@ def fold_norm(weight, bias, gamma, beta):
     return weight * gamma[None, :], bias + weight @ beta
 
 
-def merge_lora(state: dict[str, np.ndarray], path: Path, scale: float) -> int:
+def read_lora(path: Path) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """A PEFT LoRA file as ``{encoder module: (A, B)}``."""
+
     lora = {k: v.float().numpy() for k, v in load_file(str(path)).items()}
-    merged = 0
+    pairs = {}
     for key in lora:
         match = re.fullmatch(r"(?:base_model\.model\.)?(?:encoder\.)?(.+)\.lora_A(?:\.default)?\.weight", key)
-        if not match:
-            continue
-        module = match.group(1)
-        down, up = lora[key], lora[key.replace("lora_A", "lora_B")]
+        if match:
+            pairs[match.group(1)] = (lora[key], lora[key.replace("lora_A", "lora_B")])
+    if not pairs:
+        raise ValueError(f"no lora_A / lora_B pairs in {path}")
+    return pairs
+
+
+def merge_lora(state: dict[str, np.ndarray], path: Path, scale: float) -> int:
+    pairs = read_lora(path)
+    for module, (down, up) in pairs.items():
         target = f"{module}.weight"
         if target not in state:
             raise KeyError(f"LoRA module {module} is not in the encoder")
         shape = state[target].shape
-        state[target] = (state[target].reshape(shape[0], -1) + scale * up @ down).reshape(shape)
-        merged += 1
-    if not merged:
-        raise ValueError(f"no lora_A / lora_B pairs in {path}")
-    return merged
+        delta = scale * up.reshape(shape[0], -1) @ down.reshape(len(down), -1)
+        state[target] = (state[target].reshape(shape[0], -1) + delta).reshape(shape)
+    return len(pairs)
+
+
+def adapter_part(module: str, down: np.ndarray, up: np.ndarray, scale: float, s: dict[str, np.ndarray],
+                 config: EncoderConfig) -> tuple[str, int, int, np.ndarray, np.ndarray, np.ndarray]:  # fmt: skip
+    """One LoRA module as a part of an engine linear layer: ``(name, outputs, first output row, a, b, db)``."""
+
+    rank = len(down)
+    a, b = down.reshape(rank, -1), scale * up.reshape(len(up), -1)
+    gamma = beta = None
+    shift = None  # a vector the layer's input carries on top of ``a``'s input (GRN's beta)
+    row, n = 0, len(b)
+    if m := re.fullmatch(r"stages\.(\d+)\.down_conv", module):
+        p = f"stages.{m.group(1)}"
+        conv = a.reshape(rank, -1, 2)  # [r, in, 2] -> [r, 2 * in] over (frame 2t, frame 2t + 1), as the weights
+        a = np.concatenate([conv[:, :, 0], conv[:, :, 1]], axis=1)
+        gamma, beta = np.tile(s[f"{p}.down_norm.weight"], 2), np.tile(s[f"{p}.down_norm.bias"], 2)
+        name = f"{p}.down"
+    elif m := re.fullmatch(r"(stages\.\d+\.layers\.\d+)\.(fc1|fc2)", module):
+        p, layer = m.groups()
+        if layer == "fc1":
+            gamma, beta = s[f"{p}.norm.weight"], s[f"{p}.norm.bias"]
+        else:
+            shift = s[f"{p}.grn_beta"]
+        name = module
+    elif m := re.fullmatch(r"(layers\.\d+)\.(ffn1|ffn2)\.(fc1|fc2)", module):
+        p, ffn, layer = m.groups()
+        if layer == "fc1":
+            gamma, beta = s[f"{p}.{ffn}_norm.weight"], s[f"{p}.{ffn}_norm.bias"]
+        else:
+            b = 0.5 * b
+        name = module
+    elif m := re.fullmatch(r"(layers\.\d+)\.attn\.([qkv])", module):
+        p, part = m.groups()
+        gamma, beta = s[f"{p}.attn_norm.weight"], s[f"{p}.attn_norm.bias"]
+        if part == "q":
+            b = b / np.sqrt(config.width // config.heads)
+        row, n = "qkv".index(part) * config.width, 3 * config.width
+        name = f"{p}.attn.qkv"
+    elif m := re.fullmatch(r"(layers\.\d+)\.attn\.out", module):
+        name = module
+    elif m := re.fullmatch(r"(layers\.\d+)\.conv\.pointwise_(in|out)", module):
+        p, side = m.groups()
+        if side == "in":
+            gamma, beta = s[f"{p}.conv.norm.weight"], s[f"{p}.conv.norm.bias"]
+        name = f"{p}.conv.pw_{side}"
+    else:
+        raise ValueError(f"LoRA module {module}: the engine applies adapters to linear layers only (merge it instead)")
+    db = np.zeros(len(b), np.float32)
+    if beta is not None:
+        db = b @ (a @ beta)
+        a = a * gamma[None, :]
+    if shift is not None:
+        db = b @ (a @ shift)
+    return name, n, row, a, b, db
+
+
+def export_adapter(path: Path, lora: Path, scale: float, state: dict[str, np.ndarray], config: EncoderConfig,
+                   model: str) -> None:  # fmt: skip
+    """The adapter alone, folded per engine linear layer (``a``, ``b.<row>``, ``db``)."""
+
+    layers: dict[str, list] = {}
+    for module, (down, up) in read_lora(lora).items():
+        if f"{module}.weight" not in state:
+            raise KeyError(f"LoRA module {module} is not in the encoder")
+        name, n, row, a, b, db = adapter_part(module, down, up, scale, state, config)
+        layers.setdefault(name, []).append((n, row, a, b, db))
+    tensors = {}
+    for name, parts in layers.items():
+        parts.sort(key=lambda part: part[1])
+        db_all = np.zeros(parts[0][0], np.float32)
+        for _, row, a, b, db in parts:
+            tensors[f"{name}.b.{row}"] = np.ascontiguousarray(b, dtype=np.float16)
+            db_all[row : row + len(b)] += db
+        tensors[f"{name}.a"] = np.ascontiguousarray(np.concatenate([a for _, _, a, _, _ in parts]), dtype=np.float16)
+        tensors[f"{name}.db"] = db_all
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(path), metadata={"format": ADAPTER_FORMAT, "model": model, "scale": str(scale)})
+    size = sum(v.nbytes for v in tensors.values())
+    print(f"{path}: adapter for {len(layers)} layers, {size / 2**20:.1f} MiB")
 
 
 def export_encoder(out: Writer, state: dict[str, np.ndarray], config: EncoderConfig) -> None:
@@ -192,6 +290,7 @@ def main() -> None:
     parser.add_argument("--dtype", choices=("f16", "f32", "i8"), default="f16", help="the encoder's linear weights")
     parser.add_argument("--lora", type=Path, help="a LoRA adapter for the encoder, merged before export")
     parser.add_argument("--lora-scale", type=float, default=1.0, help="the adapter's alpha / rank")
+    parser.add_argument("--adapter", type=Path, help="write only this LoRA adapter, for the engine's --adapter")
     args = parser.parse_args()
 
     folder = model_folder(args.model, args.revision, lambda config: [*beat_files(config), *melody_files(config)])
@@ -199,9 +298,12 @@ def main() -> None:
     weights = load_file(str(folder / model["base_weights"]))
     state = {k[len("encoder."):]: v.float().numpy() for k, v in weights.items() if k.startswith("encoder.")}
     del weights
+    config = EncoderConfig()
+    if args.adapter:
+        export_adapter(args.out, args.adapter, args.lora_scale, state, config, model.get("name", str(args.model)))
+        return
     if args.lora:
         print(f"merged {merge_lora(state, args.lora, args.lora_scale)} LoRA modules")
-    config = EncoderConfig()
     out = Writer(args.dtype)
     export_encoder(out, state, config)
     heads = {}

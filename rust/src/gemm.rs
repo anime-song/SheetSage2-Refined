@@ -103,6 +103,35 @@ pub fn linear_block(
     accumulate: bool,
     a_scale: Option<&[f32]>,
 ) {
+    let Some(lora) = &lin.lora else {
+        return product(a, lda, m, lin, out, ldo, act, accumulate, a_scale);
+    };
+    // the adapter's (a A^T) B^T + db joins the product before the activation
+    product(a, lda, m, lin, out, ldo, Act::None, accumulate, a_scale);
+    let mut low = vec![0.0f32; m * lora.rank];
+    product(a, lda, m, &lora.down, &mut low, lora.rank, Act::None, false, a_scale);
+    for part in &lora.parts {
+        product(&low[part.low..], lora.rank, m, &part.up, &mut out[part.row..], ldo, Act::None, true, None);
+    }
+    if act == Act::Gelu {
+        for r in 0..m {
+            math::gelu_slice(&mut out[r * ldo..r * ldo + lin.n]);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn product(
+    a: &[f32],
+    lda: usize,
+    m: usize,
+    lin: &Linear,
+    out: &mut [f32],
+    ldo: usize,
+    act: Act,
+    accumulate: bool,
+    a_scale: Option<&[f32]>,
+) {
     SCRATCH.with(|s| {
         let (apack, bpanel) = &mut *s.borrow_mut();
         let row_panels = m.div_ceil(MR);
@@ -197,7 +226,7 @@ fn pack_a(a: &[f32], lda: usize, m: usize, k0: usize, kc: usize, a_scale: Option
 /// into `buf`.
 fn panel_slice<'a>(lin: &'a Linear, panel: usize, k0: usize, kc: usize, buf: &'a mut [f32]) -> (&'a [f32], usize) {
     let start = (panel * lin.k + k0) * NR;
-    match lin.w {
+    match &lin.w {
         Panels::F32(w) => (&w[start..start + kc * NR], NR),
         Panels::F16(w) => {
             convert_f16(&w[start..start + kc * NR], &mut buf[..kc * NR]);
@@ -387,8 +416,10 @@ mod tests {
         }
         let h: Vec<u16> = packed.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
         let bias = leak(vec![0.5f32; n]);
-        for (w_panels, s, tol) in [(Panels::F16(leak(h)), None, 1e-2), (Panels::I8(leak(q)), Some(leak(scale)), 5e-2)] {
-            let lin = Linear { n, k, w: w_panels, scale: s, bias };
+        for (w_panels, s, tol) in
+            [(Panels::F16(leak(h).into()), None, 1e-2), (Panels::I8(leak(q)), Some(leak(scale)), 5e-2)]
+        {
+            let lin = Linear { n, k, w: w_panels, scale: s, bias: bias.into(), lora: None };
             let mut out = vec![0.0; m * n];
             linear(&a, k, m, &lin, &mut out, n, Act::None, false, None);
             for i in 0..m {
@@ -406,7 +437,14 @@ mod tests {
         let a: Vec<f32> = (0..m * k).map(|i| ((i * 7919) % 101) as f32 / 50.0 - 1.0).collect();
         let w: Vec<f32> = (0..n * k).map(|i| ((i * 104729) % 97) as f32 / 48.0 - 1.0).collect();
         let b: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
-        let lin = Linear { n, k, w: Panels::F32(leak(pack(&w, n, k))), scale: None, bias: leak(b.clone()) };
+        let lin = Linear {
+            n,
+            k,
+            w: Panels::F32(leak(pack(&w, n, k)).into()),
+            scale: None,
+            bias: leak(b.clone()).into(),
+            lora: None,
+        };
         let mut out = vec![0.0; m * n];
         linear(&a, k, m, &lin, &mut out, n, Act::None, false, None);
         for i in 0..m {

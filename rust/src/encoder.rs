@@ -10,6 +10,7 @@ use realfft::RealFftPlanner;
 
 use crate::Result;
 use crate::gemm::{self, Act, MR, NR};
+use crate::lora::Adapter;
 use crate::math;
 use crate::weights::{Linear, Weights};
 
@@ -167,6 +168,37 @@ impl Encoder {
             rope_cos: w.f32("rope.cos")?,
             rope_sin: w.f32("rope.sin")?,
         })
+    }
+
+    /// Every linear layer with its name in the exported file.
+    pub fn linears_mut(&mut self) -> Vec<(String, &mut Linear)> {
+        let mut out = Vec::new();
+        for (i, stage) in self.stages.iter_mut().enumerate() {
+            if let Some(down) = &mut stage.down {
+                out.push((format!("stages.{i}.down"), down));
+            }
+            for (j, l) in stage.layers.iter_mut().enumerate() {
+                out.push((format!("stages.{i}.layers.{j}.fc1"), &mut l.fc1));
+                out.push((format!("stages.{i}.layers.{j}.fc2"), &mut l.fc2));
+            }
+        }
+        for (i, b) in self.blocks.iter_mut().enumerate() {
+            let p = format!("layers.{i}");
+            out.push((format!("{p}.ffn1.fc1"), &mut b.ffn1.0));
+            out.push((format!("{p}.ffn1.fc2"), &mut b.ffn1.1));
+            out.push((format!("{p}.attn.qkv"), &mut b.qkv));
+            out.push((format!("{p}.attn.out"), &mut b.out));
+            out.push((format!("{p}.conv.pw_in"), &mut b.pw_in));
+            out.push((format!("{p}.conv.pw_out"), &mut b.pw_out));
+            out.push((format!("{p}.ffn2.fc1"), &mut b.ffn2.0));
+            out.push((format!("{p}.ffn2.fc2"), &mut b.ffn2.1));
+        }
+        out
+    }
+
+    /// Apply a LoRA adapter from now on (`None`: the base weights alone).
+    pub fn set_adapter(&mut self, adapter: Option<&Adapter>) -> Result<()> {
+        Adapter::attach(adapter, self.linears_mut())
     }
 
     pub fn max_frames(&self) -> usize {

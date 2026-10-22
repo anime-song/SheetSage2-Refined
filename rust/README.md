@@ -8,8 +8,8 @@ machines without a GPU. One pass of the encoder feeds both heads; no Python or P
 ```bash
 python -m sheetsage2_refined.export_cpu cpu.safetensors [--dtype f16|f32|i8] [--lora ADAPTER --lora-scale S]
 cargo build --release
-./target/release/sheetsage2-cpu --weights cpu.safetensors [--threads N] [--out-dir DIR] [--heads beat,melody] \
-    [--tempo-weight W] [--logits] song.mp3 ...
+./target/release/sheetsage2-cpu --weights cpu.safetensors [--adapter LORA] [--threads N] [--out-dir DIR] \
+    [--heads beat,melody] [--tempo-weight W] [--logits] song.mp3 ...
 ```
 
 writes `<out-dir>/<song>.beats.json` and `<song>.melody.json` (default `outputs/cpu/`) as
@@ -19,6 +19,27 @@ writes `<out-dir>/<song>.beats.json` and `<song>.melody.json` (default `outputs/
 `--threads` defaults to one per logical CPU; on a Ryzen try the number of physical cores (8 on a 5900HX) as well.
 WAV, FLAC, MP3 and Ogg Vorbis are decoded by Symphonia and resampled to 24 kHz as `torchaudio.functional.resample`
 does; a `.f32` file is taken as raw float32 samples, mono at 24 kHz.
+
+## LoRA adapters at run time
+
+```bash
+python -m sheetsage2_refined.export_cpu my.lora.safetensors --adapter LORA.safetensors [--lora-scale S]
+./target/release/sheetsage2-cpu --weights cpu.safetensors --adapter my.lora.safetensors song.mp3
+```
+
+`--adapter` (in `export_cpu`) writes only the adapter, folded the way the weights it changes are: `A` with the
+norm's scale, `B` with the scale, the feed-forward's 0.5 and q's `1/sqrt(64)`, and the shift the norm's `beta` (or
+GRN's) sends through the adapter as an extra bias, all as float16 (a rank-16 adapter on q, k, v, out and both
+feed-forwards of all 24 blocks: 22 MiB). The engine keeps the 1.2 GB base export as it is and adds
+`(x A^T) B^T + db` to each adapted layer's output, before its GELU; q, k and v keep their own `B`s inside the
+shared `qkv` layer. Any of the encoder's linear layers can be adapted (the Conformer's, the pointwise convolutions,
+the ConvNeXt stages' and their downsampling); a LoRA on a depthwise convolution has to be merged with
+`export_cpu --lora` instead. `Model::set_adapter` swaps or removes an adapter between songs, on the CPU or the GPU.
+
+On a 60 s song the rank-16 adapter above costs no measurable time (10.9-11.3 s with it, 10.9-11.2 s without) and
+33 MiB of memory. Against the merged export the logits agree within 1.5e-5 with the adapter in float32, and within
+5e-3 in float16 for a test adapter that moves them by up to 1.6 (float16 base weights alone differ from float32 by
+up to 1.6e-2).
 
 ## On a GPU
 

@@ -1,4 +1,4 @@
-// c[m, n] (+)= act(sum_k a[m, k] * scale[k] * W[n, k] + bias[n]), W as float16 pairs in 16-column panels
+// c[m, n] = act((c[m, n] +) sum_k a[m, k] * scale[k] * W[n, k] + bias[n]), W as float16 pairs in 16-column panels
 // [ceil(N / 16)][K][16] (the CPU engine's layout).  A 128 x 128 tile per workgroup of 16 x 16 threads, k in steps
 // of 8; each thread keeps an 8 x 8 block (rows ty*4 + {0..3} and 64 + ty*4 + {0..3}, the same for columns), so
 // four vec4 reads of workgroup memory feed 64 multiply-adds.
@@ -96,12 +96,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
                     continue;
                 }
                 var v = v4[j] + bias[col];
-                if (gelu_on) {
-                    v = gelu(v);
-                }
                 let at = p.c_off + row * p.ldc + col;
                 if (add) {
                     v += c[at];
+                }
+                if (gelu_on) {
+                    v = gelu(v);
                 }
                 c[at] = v;
             }

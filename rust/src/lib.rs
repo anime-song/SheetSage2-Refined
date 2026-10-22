@@ -9,6 +9,7 @@ pub mod gemm;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod heads;
+pub mod lora;
 pub mod math;
 pub mod melody;
 pub mod post;
@@ -59,6 +60,15 @@ impl Model {
         model.gpu = Some(gpu::GpuEncoder::load(&model.weights, heads.len())?);
         model.weights.release_pages();
         Ok(model)
+    }
+
+    /// Apply a LoRA adapter to the encoder from the next song on (`None`: the base weights alone).
+    pub fn set_adapter(&mut self, adapter: Option<&lora::Adapter>) -> Result<()> {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &mut self.gpu {
+            return gpu.set_adapter(adapter);
+        }
+        self.encoder.set_adapter(adapter)
     }
 
     fn encode(&self, window: &[f32], mixes: &mut [&mut Mix]) -> Result<usize> {

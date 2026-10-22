@@ -39,9 +39,10 @@ fn main() {
         .map(|&(n, k)| Linear {
             n,
             k,
-            w: Panels::F16(leak(vec![half::f16::from_f32(0.01).to_bits(); n * k])),
+            w: Panels::F16(leak(vec![half::f16::from_f32(0.01).to_bits(); n * k]).into()),
             scale: None,
-            bias: leak(vec![0.0; n]),
+            bias: leak(vec![0.0; n]).into(),
+            lora: None,
         })
         .collect();
     let x = vec![1.0f32; m * 4096];

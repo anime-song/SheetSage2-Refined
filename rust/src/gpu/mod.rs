@@ -10,6 +10,7 @@ use wgpu::util::DeviceExt;
 
 use crate::Result;
 use crate::encoder::{Encoder, HEAD_DIM, HEADS, Mix, N_MELS, STATES, WIDTH};
+use crate::lora::Adapter;
 use crate::weights::{Linear, PANEL, Panels, Weights};
 
 const COMMON: &str = include_str!("common.wgsl");
@@ -31,6 +32,14 @@ struct GLinear {
     k: u32,
     w: wgpu::Buffer,
     bias: wgpu::Buffer,
+    lora: Option<Box<GLora>>,
+}
+
+/// A LoRA adapter (`set_adapter`): down `[R, K]`, and per part its first output, first column of `x A^T` and up.
+struct GLora {
+    rank: u32,
+    down: GLinear,
+    parts: Vec<(u32, u32, GLinear)>,
 }
 
 struct GConvNeXt {
@@ -66,6 +75,8 @@ pub struct GpuEncoder {
     pub adapter: String,
     /// What the encoder holds in GPU memory (on an integrated GPU, system memory), in bytes: weights, activations.
     pub memory: (u64, u64),
+    /// What the current LoRA adapter holds in GPU memory, in bytes.
+    pub adapter_bytes: u64,
     cpu: Encoder, // the log-mel spectrogram
     stages: Vec<GStage>,
     blocks: Vec<GBlock>,
@@ -78,6 +89,7 @@ pub struct GpuEncoder {
     wide: wgpu::Buffer,
     grn: wgpu::Buffer,
     mixes: Vec<wgpu::Buffer>,
+    low: wgpu::Buffer, // an adapter's x A^T, [rows][R]
 }
 
 fn f16_bits(v: f32) -> u16 {
@@ -231,11 +243,13 @@ impl GpuEncoder {
         Ok(Self {
             adapter: format!("{} ({:?})", info.name, info.backend),
             memory: (weight_bytes, activation_bytes),
+            adapter_bytes: 0,
             rows: [storage("rows0", row_floats), storage("rows1", row_floats), storage("rows2", row_floats)],
             wide: storage("wide", wide_floats),
             grn: storage("grn", 2 * 4096),
             mixes: (0..mixes).map(|i| storage(&format!("mix{i}"), frames * WIDTH)).collect(),
             dummy: storage("dummy", 4),
+            low: storage("low", 1),
             device,
             queue,
             k,
@@ -257,7 +271,7 @@ impl GpuEncoder {
 
     /// A linear layer's panels as float16 (int8 weights times their scales, float32 rounded).
     fn linear(device: &wgpu::Device, lin: &Linear, name: &str) -> Result<GLinear> {
-        let half: Vec<u16> = match lin.w {
+        let half: Vec<u16> = match &lin.w {
             Panels::F16(w) => w.to_vec(),
             Panels::F32(w) => w.iter().map(|&v| f16_bits(v)).collect(),
             Panels::I8(w) => {
@@ -276,8 +290,78 @@ impl GpuEncoder {
             n: lin.n as u32,
             k: lin.k as u32,
             w: Self::upload(device, name, &raw),
-            bias: Self::upload(device, &format!("{name}.b"), bytes(lin.bias)),
+            bias: Self::upload(device, &format!("{name}.b"), bytes(&lin.bias)),
+            lora: None,
         })
+    }
+
+    /// Every linear layer with its name in the exported file.
+    fn linears_mut(&mut self) -> Vec<(String, &mut GLinear)> {
+        let mut out = Vec::new();
+        for (i, stage) in self.stages.iter_mut().enumerate() {
+            if let Some(down) = &mut stage.down {
+                out.push((format!("stages.{i}.down"), down));
+            }
+            for (j, l) in stage.layers.iter_mut().enumerate() {
+                out.push((format!("stages.{i}.layers.{j}.fc1"), &mut l.fc1));
+                out.push((format!("stages.{i}.layers.{j}.fc2"), &mut l.fc2));
+            }
+        }
+        for (i, b) in self.blocks.iter_mut().enumerate() {
+            let p = format!("layers.{i}");
+            out.push((format!("{p}.ffn1.fc1"), &mut b.ffn1.0));
+            out.push((format!("{p}.ffn1.fc2"), &mut b.ffn1.1));
+            out.push((format!("{p}.attn.qkv"), &mut b.qkv));
+            out.push((format!("{p}.attn.out"), &mut b.out));
+            out.push((format!("{p}.conv.pw_in"), &mut b.pw_in));
+            out.push((format!("{p}.conv.pw_out"), &mut b.pw_out));
+            out.push((format!("{p}.ffn2.fc1"), &mut b.ffn2.0));
+            out.push((format!("{p}.ffn2.fc2"), &mut b.ffn2.1));
+        }
+        out
+    }
+
+    /// Apply a LoRA adapter from now on (`None`: the base weights alone): its layers go to GPU memory as float16,
+    /// the previous adapter's are freed.
+    pub fn set_adapter(&mut self, adapter: Option<&Adapter>) -> Result<()> {
+        if let Some(a) = adapter {
+            let layers: Vec<(String, u32, u32)> = self.linears_mut().into_iter().map(|(n, l)| (n, l.n, l.k)).collect();
+            for (name, lora) in &a.layers {
+                let (_, n, k) = layers
+                    .iter()
+                    .find(|(n, ..)| n == name)
+                    .ok_or_else(|| format!("adapter layer {name}: not in the encoder"))?;
+                lora.check(name, *n as usize, *k as usize)?;
+            }
+        }
+        let device = self.device.clone();
+        let mut rank = 0;
+        let mut bytes = 0;
+        for (name, l) in self.linears_mut() {
+            l.lora = None;
+            let Some(lora) = adapter.and_then(|a| a.layers.get(&name)) else { continue };
+            lora.check(&name, l.n as usize, l.k as usize)?;
+            let down = Self::linear(&device, &lora.down, &format!("{name}.lora.down"))?;
+            bytes += down.w.size() + down.bias.size();
+            let mut parts = Vec::new();
+            for part in &lora.parts {
+                let up = Self::linear(&device, &part.up, &format!("{name}.lora.up.{}", part.row))?;
+                bytes += up.w.size() + up.bias.size();
+                parts.push((part.row as u32, part.low as u32, up));
+            }
+            rank = rank.max(lora.rank);
+            l.lora = Some(Box::new(GLora { rank: lora.rank as u32, down, parts }));
+        }
+        // the most rows a linear layer sees: the first stage's, 4 per 25 Hz frame
+        let rows = 4 * (self.max_frames as usize + 1);
+        self.low = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("low"),
+            size: (rows * rank).max(1) as u64 * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        self.adapter_bytes = bytes + self.low.size();
+        Ok(())
     }
 
     pub fn max_frames(&self) -> usize {
@@ -580,9 +664,38 @@ impl GpuEncoder {
         add: bool,
         scale: Option<u32>,
     ) {
+        let Some(lora) = &l.lora else {
+            return self.product(enc, a, lda, m, 0, l, c, ldc, c_off, gelu, add, scale);
+        };
+        // the adapter's (a A^T) B^T + db joins the product before the activation (applied with the last part, so
+        // only on a layer that one part covers whole: the feed-forward's fc1)
+        assert!(!gelu || (lora.parts.len() == 1 && lora.parts[0].2.n == l.n));
+        self.product(enc, a, lda, m, 0, l, c, ldc, c_off, false, add, scale);
+        self.product(enc, a, lda, m, 0, &lora.down, &self.low, lora.rank, 0, false, false, scale);
+        for (row, low, up) in &lora.parts {
+            self.product(enc, &self.low, lora.rank, m, *low, up, c, ldc, c_off + row, gelu, true, None);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn product(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        a: &wgpu::Buffer,
+        lda: u32,
+        m: u32,
+        a_off: u32,
+        l: &GLinear,
+        c: &wgpu::Buffer,
+        ldc: u32,
+        c_off: u32,
+        gelu: bool,
+        add: bool,
+        scale: Option<u32>,
+    ) {
         let flags = gelu as u32 | (add as u32) << 1 | (scale.is_some() as u32) << 2;
         let n_pad = l.n.div_ceil(PANEL as u32) * PANEL as u32;
-        let params = self.params(&[m, l.n, n_pad, l.k, lda, ldc, 0, c_off, flags, 0, 0, 0]);
+        let params = self.params(&[m, l.n, n_pad, l.k, lda, ldc, a_off, c_off, flags, 0, 0, 0]);
         // GRN's gains follow its sums in `grn` (`grn_gain`): bound from there
         let scale_buf = if scale.is_some() { &self.grn } else { &self.dummy };
         let layout = self.k.gemm.get_bind_group_layout(0);

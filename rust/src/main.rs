@@ -1,10 +1,10 @@
-//! sheetsage2-cpu --weights cpu.safetensors [--threads N] [--out-dir DIR] [--heads beat,melody] [--device cpu|gpu] [--logits]
+//! sheetsage2-cpu --weights cpu.safetensors [--adapter LORA] [--threads N] [--out-dir DIR] [--heads beat,melody] [--device cpu|gpu] [--logits]
 //!                [--tempo-weight W] [--hold P] AUDIO...
 //!
 //! Writes `<out-dir>/<stem>.beats.json` and `<stem>.melody.json` as `python -m sheetsage2_refined.beats` / `.melody`
 //! do, and with `--logits` also `<stem>.heads.safetensors` with each head's logits (`<head>.<output>`,
 //! `[frames, width]`).  AUDIO may be a WAV / FLAC / MP3 / Ogg file, or a `.f32` file of raw little-endian float32
-//! samples, mono at 24 kHz.
+//! samples, mono at 24 kHz.  `--adapter` applies a LoRA adapter (`export_cpu --adapter`) to the encoder at run time.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -14,7 +14,7 @@ use sheetsage2_cpu::{MemoryWatch, Model, Outputs, Result, audio, encoder::SAMPLE
 
 fn usage() -> ! {
     eprintln!(
-        "usage: sheetsage2-cpu --weights FILE [--threads N] [--out-dir DIR] [--heads beat,melody] [--device cpu|gpu] [--logits] \
+        "usage: sheetsage2-cpu --weights FILE [--adapter LORA] [--threads N] [--out-dir DIR] [--heads beat,melody] [--device cpu|gpu] [--logits] \
          [--tempo-weight W] [--hold P] AUDIO..."
     );
     std::process::exit(2)
@@ -75,9 +75,11 @@ fn main() -> Result<()> {
     let mut hold = 0.0f64; // the beat tracker's fermata holds (`beats --hold`)
     let mut from_logits = false;
     let mut device = "cpu".to_string(); // inputs are `--logits` files: run the trackers only (for testing them)
+    let mut adapter = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--weights" => weights = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--adapter" => adapter = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--threads" => threads = Some(args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(|| usage())),
             "--out-dir" => out_dir = PathBuf::from(args.next().unwrap_or_else(|| usage())),
             "--heads" => heads = args.next().unwrap_or_else(|| usage()),
@@ -97,7 +99,7 @@ fn main() -> Result<()> {
     sheetsage2_cpu::simd::init_threads(threads)?;
     let started = Instant::now();
     let heads: Vec<&str> = heads.split(',').filter(|h| !h.is_empty()).collect();
-    let model = match device.as_str() {
+    let mut model = match device.as_str() {
         "cpu" => Model::load(&weights, &heads)?,
         #[cfg(feature = "gpu")]
         "gpu" => Model::load_gpu(&weights, &heads)?,
@@ -105,6 +107,16 @@ fn main() -> Result<()> {
         "gpu" => return Err("built without the GPU encoder: cargo build --release --features gpu".into()),
         _ => usage(),
     };
+    if let Some(path) = &adapter {
+        let adapter = sheetsage2_cpu::lora::Adapter::open(path)?;
+        model.set_adapter(Some(&adapter))?;
+        eprintln!(
+            "adapter {}: {} layers, {:.1} MiB",
+            path.display(),
+            adapter.layers.len(),
+            adapter.bytes() as f64 / (1 << 20) as f64
+        );
+    }
     #[cfg(feature = "gpu")]
     if let Some(gpu) = &model.gpu {
         let mib = |b: u64| b as f64 / (1 << 20) as f64;

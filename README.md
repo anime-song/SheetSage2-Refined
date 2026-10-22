@@ -122,11 +122,13 @@ result["notes"]   # [{"start": 12.34, "end": 12.58, "pitch": 67, "track": 0, "st
 
 ```bash
 python -m sheetsage2_refined.export_cpu cpu.safetensors          # once; --lora ADAPTER merges a LoRA adapter first
+python -m sheetsage2_refined.export_cpu my.lora.safetensors --adapter ADAPTER   # or: a LoRA for --adapter at run time
 (cd rust && cargo build --release)
 rust/target/release/sheetsage2-cpu --weights cpu.safetensors song.mp3   # -> outputs/cpu/song.beats.json, song.melody.json
 ```
 
-The JSON is what `beats` and `melody` write. Built with `--features gpu`, `--device gpu` runs the encoder on a GPU
+The JSON is what `beats` and `melody` write. `--adapter my.lora.safetensors` applies a LoRA adapter at run time
+next to the unchanged base export (a few to a few tens of MiB per adapter, swappable between songs). Built with `--features gpu`, `--device gpu` runs the encoder on a GPU
 through Vulkan (made for integrated GPUs such as a Ryzen's Radeon). See [rust/README.md](rust/README.md) for how it
 works, its accuracy against PyTorch, speed and tuning.
 

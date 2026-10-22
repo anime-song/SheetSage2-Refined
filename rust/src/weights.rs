@@ -4,29 +4,72 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 
 use crate::Result;
+use crate::lora::Lora;
 
 pub const PANEL: usize = 16;
 
-#[derive(Clone, Copy)]
+/// Values in the mapped file, or owned (an adapter's, freed with it).
+pub enum Shared<T: 'static> {
+    Mapped(&'static [T]),
+    Owned(Arc<[T]>),
+}
+
+pub type Floats = Shared<f32>;
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Shared::Mapped(v) => Shared::Mapped(v),
+            Shared::Owned(v) => Shared::Owned(v.clone()),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        match self {
+            Shared::Mapped(v) => v,
+            Shared::Owned(v) => v,
+        }
+    }
+}
+
+impl<T> From<&'static [T]> for Shared<T> {
+    fn from(v: &'static [T]) -> Self {
+        Shared::Mapped(v)
+    }
+}
+
+impl<T> From<Vec<T>> for Shared<T> {
+    fn from(v: Vec<T>) -> Self {
+        Shared::Owned(v.into())
+    }
+}
+
+#[derive(Clone)]
 pub enum Panels {
-    F32(&'static [f32]),
-    F16(&'static [u16]),
+    F32(Floats),
+    F16(Shared<u16>),
     I8(&'static [i8]),
 }
 
 /// A linear layer `y = W x + b`, `W` `[n, k]` stored as panels `[ceil(n / 16), k, 16]`; int8 weights carry a scale
-/// per output channel.
+/// per output channel.  `lora` adds a LoRA adapter's `(x A^T) B^T` (`crate::lora`).
+#[derive(Clone)]
 pub struct Linear {
     pub n: usize,
     pub k: usize,
     pub w: Panels,
     pub scale: Option<&'static [f32]>,
-    pub bias: &'static [f32],
+    pub bias: Floats,
+    pub lora: Option<Arc<Lora>>,
 }
 
 impl Linear {
@@ -116,8 +159,8 @@ impl Weights {
         let (dtype, shape, _) = self.tensors.get(&key).ok_or_else(|| format!("missing tensor {key}"))?;
         let (panels, k) = (shape[0], shape[1]);
         let w = match dtype {
-            Dtype::F32 => Panels::F32(Self::cast(self.raw(&key, Dtype::F32)?.0, &key)?),
-            Dtype::F16 => Panels::F16(Self::cast(self.raw(&key, Dtype::F16)?.0, &key)?),
+            Dtype::F32 => Panels::F32(Self::cast(self.raw(&key, Dtype::F32)?.0, &key)?.into()),
+            Dtype::F16 => Panels::F16(Self::cast(self.raw(&key, Dtype::F16)?.0, &key)?.into()),
             Dtype::I8 => Panels::I8(Self::cast(self.raw(&key, Dtype::I8)?.0, &key)?),
             other => return Err(format!("{key}: unsupported dtype {other:?}").into()),
         };
@@ -127,6 +170,6 @@ impl Weights {
             return Err(format!("{name}: {n} outputs in {panels} panels").into());
         }
         let scale = if self.has(&format!("{name}.s")) { Some(self.f32(&format!("{name}.s"))?) } else { None };
-        Ok(Linear { n, k, w, scale, bias })
+        Ok(Linear { n, k, w, scale, bias: bias.into(), lora: None })
     }
 }
