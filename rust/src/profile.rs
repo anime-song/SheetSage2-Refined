@@ -5,7 +5,7 @@ use std::time::Instant;
 
 static TIMES: Mutex<Vec<(&'static str, f64)>> = Mutex::new(Vec::new());
 
-fn enabled() -> bool {
+pub fn enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("SHEETSAGE_PROFILE").is_some_and(|v| v != "0"))
 }
@@ -27,6 +27,18 @@ pub fn time<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
         None => times.push((name, elapsed)),
     }
     out
+}
+
+/// Adds `seconds` to `name`'s total.
+pub fn add(name: &'static str, seconds: f64) {
+    if !enabled() {
+        return;
+    }
+    let mut times = TIMES.lock().unwrap();
+    match times.iter_mut().find(|(n, _)| *n == name) {
+        Some((_, t)) => *t += seconds,
+        None => times.push((name, seconds)),
+    }
 }
 
 pub fn report() {

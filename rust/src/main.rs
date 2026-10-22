@@ -1,4 +1,4 @@
-//! sheetsage2-cpu --weights cpu.safetensors [--threads N] [--out-dir DIR] [--heads beat,melody] [--logits]
+//! sheetsage2-cpu --weights cpu.safetensors [--threads N] [--out-dir DIR] [--heads beat,melody] [--device cpu|gpu] [--logits]
 //!                [--tempo-weight W] [--hold P] AUDIO...
 //!
 //! Writes `<out-dir>/<stem>.beats.json` and `<stem>.melody.json` as `python -m sheetsage2_refined.beats` / `.melody`
@@ -14,7 +14,7 @@ use sheetsage2_cpu::{MemoryWatch, Model, Outputs, Result, audio, encoder::SAMPLE
 
 fn usage() -> ! {
     eprintln!(
-        "usage: sheetsage2-cpu --weights FILE [--threads N] [--out-dir DIR] [--heads beat,melody] [--logits] \
+        "usage: sheetsage2-cpu --weights FILE [--threads N] [--out-dir DIR] [--heads beat,melody] [--device cpu|gpu] [--logits] \
          [--tempo-weight W] [--hold P] AUDIO..."
     );
     std::process::exit(2)
@@ -73,7 +73,8 @@ fn main() -> Result<()> {
     let (mut weights, mut threads, mut out_dir) = (None, None, PathBuf::from("outputs/cpu"));
     let (mut heads, mut logits, mut tempo_weight, mut inputs) = ("beat,melody".to_string(), false, 4.0, Vec::new());
     let mut hold = 0.0f64; // the beat tracker's fermata holds (`beats --hold`)
-    let mut from_logits = false; // inputs are `--logits` files: run the trackers only (for testing them)
+    let mut from_logits = false;
+    let mut device = "cpu".to_string(); // inputs are `--logits` files: run the trackers only (for testing them)
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--weights" => weights = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
@@ -81,6 +82,7 @@ fn main() -> Result<()> {
             "--out-dir" => out_dir = PathBuf::from(args.next().unwrap_or_else(|| usage())),
             "--heads" => heads = args.next().unwrap_or_else(|| usage()),
             "--logits" => logits = true,
+            "--device" => device = args.next().unwrap_or_else(|| usage()),
             "--from-logits" => from_logits = true,
             "--hold" => hold = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--tempo-weight" => tempo_weight = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
@@ -95,7 +97,24 @@ fn main() -> Result<()> {
     sheetsage2_cpu::simd::init_threads(threads)?;
     let started = Instant::now();
     let heads: Vec<&str> = heads.split(',').filter(|h| !h.is_empty()).collect();
-    let model = Model::load(&weights, &heads)?;
+    let model = match device.as_str() {
+        "cpu" => Model::load(&weights, &heads)?,
+        #[cfg(feature = "gpu")]
+        "gpu" => Model::load_gpu(&weights, &heads)?,
+        #[cfg(not(feature = "gpu"))]
+        "gpu" => return Err("built without the GPU encoder: cargo build --release --features gpu".into()),
+        _ => usage(),
+    };
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = &model.gpu {
+        let mib = |b: u64| b as f64 / (1 << 20) as f64;
+        eprintln!(
+            "encoder on {}: {:.0} MiB of weights and {:.0} MiB of activations in GPU memory",
+            gpu.adapter,
+            mib(gpu.memory.0),
+            mib(gpu.memory.1)
+        );
+    }
     let decoding: serde_json::Value =
         serde_json::from_str(model.weights.metadata.get("melody_decoding").map_or("{}", |s| s))?;
     eprintln!(

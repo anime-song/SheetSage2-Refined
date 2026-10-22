@@ -6,6 +6,8 @@
 pub mod audio;
 pub mod encoder;
 pub mod gemm;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod heads;
 pub mod math;
 pub mod melody;
@@ -26,6 +28,9 @@ pub const WINDOW_SAMPLES: usize = 300 * SAMPLE_RATE;
 
 pub struct Model {
     pub encoder: Encoder,
+    /// The encoder on a GPU instead (`load_gpu`).
+    #[cfg(feature = "gpu")]
+    pub gpu: Option<gpu::GpuEncoder>,
     pub heads: Vec<(String, Head)>,
     pub weights: Weights,
 }
@@ -38,7 +43,30 @@ impl Model {
         let weights = Weights::open(path)?;
         let encoder = Encoder::load(&weights)?;
         let heads = heads.iter().map(|&h| Ok((h.to_string(), Head::load(&weights, h)?))).collect::<Result<Vec<_>>>()?;
-        Ok(Self { encoder, heads, weights })
+        Ok(Self {
+            encoder,
+            heads,
+            weights,
+            #[cfg(feature = "gpu")]
+            gpu: None,
+        })
+    }
+
+    /// As `load`, with the encoder on the GPU.
+    #[cfg(feature = "gpu")]
+    pub fn load_gpu(path: &std::path::Path, heads: &[&str]) -> Result<Self> {
+        let mut model = Self::load(path, heads)?;
+        model.gpu = Some(gpu::GpuEncoder::load(&model.weights, heads.len())?);
+        model.weights.release_pages();
+        Ok(model)
+    }
+
+    fn encode(&self, window: &[f32], mixes: &mut [&mut Mix]) -> Result<usize> {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &self.gpu {
+            return gpu.forward(window, mixes);
+        }
+        self.encoder.forward(window, mixes)
     }
 
     /// The heads' logits for a 24 kHz waveform (`beats.frame_outputs`): per head, its outputs over all windows.
@@ -47,7 +75,7 @@ impl Model {
         for start in (0..wave.len()).step_by(WINDOW_SAMPLES) {
             let window = &wave[start..(start + WINDOW_SAMPLES).min(wave.len())];
             let mut mixes: Vec<Mix> = self.heads.iter().map(|(_, h)| Mix::new(h.mix)).collect();
-            let frames = self.encoder.forward(window, &mut mixes.iter_mut().collect::<Vec<_>>())?;
+            let frames = self.encode(window, &mut mixes.iter_mut().collect::<Vec<_>>())?;
             for ((_, head), (mix, (_, outputs))) in self.heads.iter().zip(mixes.iter().zip(all.iter_mut())) {
                 let outs = profile::time("heads", || head.forward(&mix.sum, frames));
                 for (i, (name, width, logits)) in outs.into_iter().enumerate() {

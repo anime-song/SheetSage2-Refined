@@ -20,6 +20,28 @@ writes `<out-dir>/<song>.beats.json` and `<song>.melody.json` (default `outputs/
 WAV, FLAC, MP3 and Ogg Vorbis are decoded by Symphonia and resampled to 24 kHz as `torchaudio.functional.resample`
 does; a `.f32` file is taken as raw float32 samples, mono at 24 kHz.
 
+## On a GPU
+
+```bash
+cargo build --release --features gpu
+./target/release/sheetsage2-cpu --device gpu --weights cpu.safetensors song.mp3
+cargo run --release --features gpu --example gpu_bench -- cpu.safetensors   # kernels vs the CPU's, GFLOP/s
+```
+
+`--device gpu` runs the encoder through wgpu (Vulkan on Linux: Mesa's RADV for an AMD GPU, `vulkaninfo --summary`
+lists what is there; `SHEETSAGE_GPU=<part of the name>` picks an adapter). The log-mel spectrogram, the heads and
+the trackers stay on the CPU. The shaders (`src/gpu/*.wgsl`) compute what the CPU kernels do, in float32 with the
+float16 weights: a 128 x 128-tile GEMM with 8 x 8 outputs per thread, the row norms and convolutions one workgroup
+per row, flash-style attention 32 queries x 32 keys at a time. GPU memory (on an integrated GPU, system memory):
+1.2 GB of weights and 264 MB of activations, allocated once for the longest window; the CPU's mapping of the
+weights is dropped after the upload. The work is submitted a block at a time, so no submission runs long enough
+for the driver to reset the GPU.
+
+Developed without the GPU it is meant for: checked on Mesa's software Vulkan (llvmpipe), where the logits of a
+60 s synthetic song are within 5e-4 of the CPU engine's (beats, bars and notes identical) and `gpu_bench`'s linear
+layers and attention on a whole 300 s window within 2e-5. Its speed has to be measured on the real GPU:
+`SHEETSAGE_PROFILE=1` prints the GPU time per part (it waits for the GPU after each, so the total grows a little).
+
 ## How it works
 
 * `export_cpu` folds every constant it can: LayerNorm scales and shifts into the linear layer that follows, the

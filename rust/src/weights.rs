@@ -63,6 +63,15 @@ impl Weights {
         Ok(Self { map, tensors, metadata })
     }
 
+    /// Drop this process's resident pages of the file (Linux `MADV_DONTNEED`): after the encoder's weights went to
+    /// the GPU, only the heads' small tensors are read again (and come back from the page cache when they are).
+    pub fn release_pages(&self) {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::madvise(self.map.as_ptr() as *mut libc::c_void, self.map.len(), libc::MADV_DONTNEED);
+        }
+    }
+
     pub fn has(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
     }

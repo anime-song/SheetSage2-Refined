@@ -7,13 +7,23 @@ edition = "2024"
 half = "2.7.1"
 libc = "0.2.191"
 memmap2 = "0.9.12"
+pollster = { version = "1.0.1", optional = true }
 rayon = "1.12.0"
 realfft = "3.5.0"
 safetensors = "0.8.0"
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 symphonia = { version = "0.6.1", features = ["mp3", "wav", "flac", "pcm", "ogg", "vorbis"] }
+wgpu = { version = "30.0.1", optional = true }
+
+[features]
+# the encoder on a GPU through wgpu (Vulkan on Linux): `cargo build --release --features gpu`
+gpu = ["dep:wgpu", "dep:pollster"]
 
 [profile.release]
 codegen-units = 1
 lto = "thin"
 debug = 1
+
+[[example]]
+name = "gpu_bench"
+required-features = ["gpu"]

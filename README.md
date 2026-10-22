@@ -126,8 +126,9 @@ python -m sheetsage2_refined.export_cpu cpu.safetensors          # once; --lora 
 rust/target/release/sheetsage2-cpu --weights cpu.safetensors song.mp3   # -> outputs/cpu/song.beats.json, song.melody.json
 ```
 
-The JSON is what `beats` and `melody` write. See [rust/README.md](rust/README.md) for how it works, its accuracy
-against PyTorch, speed and tuning.
+The JSON is what `beats` and `melody` write. Built with `--features gpu`, `--device gpu` runs the encoder on a GPU
+through Vulkan (made for integrated GPUs such as a Ryzen's Radeon). See [rust/README.md](rust/README.md) for how it
+works, its accuracy against PyTorch, speed and tuning.
 
 ## License
 
