@@ -93,7 +93,7 @@ def main():
         reference.parent.mkdir(parents=True, exist_ok=True)
         save_file(tensors, str(reference), metadata={"duration": str(len(wave) / 24000)})
 
-    command = [str(args.binary), "--weights", str(args.weights), "--out-dir", str(tmp)]
+    command = [str(args.binary), "--weights", str(args.weights), "--out-dir", str(tmp), "--logits"]
     if args.threads:
         command += ["--threads", str(args.threads)]
     subprocess.run(command + [str(raw)], check=True)

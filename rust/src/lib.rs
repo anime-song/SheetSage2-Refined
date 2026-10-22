@@ -8,8 +8,11 @@ pub mod encoder;
 pub mod gemm;
 pub mod heads;
 pub mod math;
+pub mod melody;
+pub mod post;
 pub mod profile;
 pub mod simd;
+pub mod tracker;
 pub mod weights;
 
 use encoder::{Encoder, Mix, SAMPLE_RATE};
