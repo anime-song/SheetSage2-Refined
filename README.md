@@ -114,6 +114,22 @@ result["notes"]   # [{"start": 12.34, "end": 12.58, "pitch": 67, "track": 0, "st
 `pitch` is the MIDI note (sounding pitch), `track` 0 sung / 1 played, `steps` the note's length in sixteenths and
 `pos` the sixteenth of its beat it starts on. Note times are not placed on the beat grid yet.
 
+### On the CPU (Rust engine, no PyTorch at run time)
+
+`rust/` runs the encoder and the beat and melody heads on the CPU with its own AVX2 + FMA kernels (any x86-64 CPU
+from Zen 2 / Haswell on; others fall back to slower portable code). It reads one file that
+`export_cpu` folds and packs the weights into, by default as float16 (1.2 GB; `--dtype i8` makes it 0.6 GB):
+
+```bash
+python -m sheetsage2_refined.export_cpu cpu.safetensors          # --lora ADAPTER merges a LoRA adapter first
+(cd rust && cargo build --release)
+python -m sheetsage2_refined.cpu song.mp3 --weights cpu.safetensors   # -> outputs/cpu/song.beats.json, song.melody.json
+```
+
+The engine alone (`rust/target/release/sheetsage2-cpu --weights cpu.safetensors song.mp3`) writes the heads' logits;
+`sheetsage2_refined.cpu` turns them into beats, bars and notes as `beats` and `melody` do. See
+[rust/README.md](rust/README.md) for how it works, its accuracy against PyTorch and tuning.
+
 ## License
 
 The code is MIT. The model weights are CC BY-NC 4.0 (non-commercial use only), as are SheetSage2 and
