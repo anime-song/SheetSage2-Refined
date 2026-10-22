@@ -1,5 +1,5 @@
 //! sheetsage2-cpu --weights cpu.safetensors [--threads N] [--out-dir DIR] [--heads beat,melody] [--logits]
-//!                [--tempo-weight W] AUDIO...
+//!                [--tempo-weight W] [--hold P] AUDIO...
 //!
 //! Writes `<out-dir>/<stem>.beats.json` and `<stem>.melody.json` as `python -m sheetsage2_refined.beats` / `.melody`
 //! do, and with `--logits` also `<stem>.heads.safetensors` with each head's logits (`<head>.<output>`,
@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use safetensors::tensor::{Dtype, TensorView};
-use sheetsage2_cpu::{Model, Outputs, Result, audio, encoder::SAMPLE_RATE, peak_rss_mib, post};
+use sheetsage2_cpu::{MemoryWatch, Model, Outputs, Result, audio, encoder::SAMPLE_RATE, post};
 
 fn usage() -> ! {
     eprintln!(
         "usage: sheetsage2-cpu --weights FILE [--threads N] [--out-dir DIR] [--heads beat,melody] [--logits] \
-         [--tempo-weight W] AUDIO..."
+         [--tempo-weight W] [--hold P] AUDIO..."
     );
     std::process::exit(2)
 }
@@ -72,6 +72,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let (mut weights, mut threads, mut out_dir) = (None, None, PathBuf::from("outputs/cpu"));
     let (mut heads, mut logits, mut tempo_weight, mut inputs) = ("beat,melody".to_string(), false, 4.0, Vec::new());
+    let mut hold = 0.0f64; // the beat tracker's fermata holds (`beats --hold`)
     let mut from_logits = false; // inputs are `--logits` files: run the trackers only (for testing them)
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -81,6 +82,7 @@ fn main() -> Result<()> {
             "--heads" => heads = args.next().unwrap_or_else(|| usage()),
             "--logits" => logits = true,
             "--from-logits" => from_logits = true,
+            "--hold" => hold = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--tempo-weight" => tempo_weight = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "-h" | "--help" => usage(),
             _ => inputs.push(PathBuf::from(arg)),
@@ -103,8 +105,10 @@ fn main() -> Result<()> {
         started.elapsed().as_secs_f64(),
         sheetsage2_cpu::simd::avx2()
     );
+    let tracker_options = sheetsage2_cpu::tracker::Options { p_hold: hold, ..Default::default() };
     std::fs::create_dir_all(&out_dir)?;
     for input in &inputs {
+        let watch = MemoryWatch::start();
         let t0 = Instant::now();
         let (outputs, duration, t1) = if from_logits {
             let (outputs, duration) = read_logits(input)?;
@@ -122,7 +126,7 @@ fn main() -> Result<()> {
         let mut written = Vec::new();
         for (head, outs) in &outputs {
             let (suffix, result) = match head.as_str() {
-                "beat" => ("beats", post::beats_json(outs, &name, duration, tempo_weight)?),
+                "beat" => ("beats", post::beats_json(outs, &name, duration, &tracker_options, tempo_weight)?),
                 "melody" => ("melody", post::melody_json(outs, &name, duration, &decoding)?),
                 _ => continue,
             };
@@ -137,15 +141,21 @@ fn main() -> Result<()> {
         }
         sheetsage2_cpu::profile::report();
         let t3 = Instant::now();
+        let (anon, file) = watch.stop();
+        drop(outputs);
+        sheetsage2_cpu::release_memory();
+        if std::env::var_os("SHEETSAGE_PROFILE").is_some() {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            eprintln!("  after the request: {}", status.lines().find(|l| l.starts_with("RssAnon")).unwrap_or(""));
+        }
         let encode = (t2 - t1).as_secs_f64();
         eprintln!(
             "{}: {duration:.1} s of audio, decode {:.2} s, encoder + heads {encode:.2} s ({:.1}x real time), trackers {:.2} s, \
-             peak RSS {:.0} MiB -> {}",
+             memory {anon:.0} MiB + weights {file:.0} MiB mapped -> {}",
             input.display(),
             (t1 - t0).as_secs_f64(),
             duration / encode,
             (t3 - t2).as_secs_f64(),
-            peak_rss_mib().unwrap_or(f64::NAN),
             written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
         );
     }

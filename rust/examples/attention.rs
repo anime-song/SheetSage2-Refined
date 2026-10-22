@@ -23,14 +23,16 @@ fn main() {
         (0..(frames + MR) * 3 * WIDTH).map(|i| rand() * if i % (3 * WIDTH) < WIDTH { sharp } else { 1.0 }).collect();
     let keys: Vec<f32> = (0..HEADS * HEAD_DIM * padded).map(|_| rand() * 4.0).collect();
     let values: Vec<f32> = (0..HEADS * HEAD_DIM * padded).map(|_| rand()).collect();
-    let mut out = vec![0.0f32; frames * WIDTH];
-    attend(&qkv, &keys, &values, padded, frames, &mut out);
-    let reps = 3;
-    let start = Instant::now();
-    for _ in 0..reps {
-        attend(&qkv, &keys, &values, padded, frames, &mut out);
+    let mut q: Vec<f32> = qkv.chunks(3 * WIDTH).flat_map(|r| r[..WIDTH].to_vec()).collect();
+    attend(&mut q.clone(), &keys, &values, padded, frames);
+    let mut best = f64::INFINITY;
+    for _ in 0..3 {
+        q.iter_mut().zip(qkv.chunks(3 * WIDTH).flat_map(|r| r[..WIDTH].to_vec())).for_each(|(q, v)| *q = v);
+        let start = Instant::now();
+        attend(&mut q, &keys, &values, padded, frames);
+        best = best.min(start.elapsed().as_secs_f64());
     }
-    let secs = start.elapsed().as_secs_f64() / reps as f64;
+    let secs = best;
     let flops = 4.0 * (frames * frames * WIDTH) as f64;
     println!("{frames} frames, {threads} threads: {secs:.3} s, {:.1} GFLOP/s", flops / secs / 1e9);
 }

@@ -78,7 +78,7 @@ def melody_probabilities(out: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     return probs | {"melody_offset": out["melody_offset"]}
 
 
-def trackers(weights: Path, tempo_weight: float = 4.0) -> tuple[HeadBeats, HeadMelody]:
+def trackers(weights: Path, tempo_weight: float = 4.0, p_hold: float = 0.0) -> tuple[HeadBeats, HeadMelody]:
     """The beat and melody trackers without their encoder and heads (the engine runs those), set up as the
     exported model's (``melody_tracker.decoding``)."""
 
@@ -86,6 +86,6 @@ def trackers(weights: Path, tempo_weight: float = 4.0) -> tuple[HeadBeats, HeadM
         meta = f.metadata()
     heads = json.loads(meta["heads"])
     decoding = json.loads(meta.get("melody_decoding", "{}"))
-    beats = HeadBeats(None, None, None, tempo_weight=tempo_weight)
+    beats = HeadBeats(None, None, None, tempo_weight=tempo_weight, p_hold=p_hold)
     melody = HeadMelody(None, None, None, line="line" in heads["melody"]["outputs"], **decoding)
     return beats, melody

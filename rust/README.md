@@ -64,16 +64,24 @@ Python ones on the logits of both songs and on 20 noisy copies (noise up to 3 on
 On the 4-vCPU cloud machine it was developed on (Intel Xeon, AVX2 code path only, timings vary by 5-10% from run to
 run), float16 weights, a 300 s song:
 
-| | time | peak memory |
+| | time | memory |
 |---|---|---|
-| this engine: encoder + both heads + both trackers | 69 s + 1.4 s | 1.5 GB |
+| this engine: encoder + both heads + both trackers | 69 s + 1.4 s | 217 MB own + 1.2 GB mapped weights |
 | PyTorch, AVX2 only (as on a Zen 3): encoder + beat head | 70 s, again for the melody head | 5.5 GB |
 | PyTorch with AVX-512: encoder + beat head | 49 s, again for the melody head | 5.5 GB |
 
 Per encoder pass the engine is about as fast as PyTorch's MKL / oneDNN kernels on the same instruction set; it is
-faster when both heads are needed and uses a quarter of the memory. Of a 300 s run: feed-forward 26 s, attention
-32 s (25 s of it the scores, softmax and weighted values, at about 80% of the FMA peak), convolution module 6 s,
-ConvNeXt stages 5 s, heads 3 s (`SHEETSAGE_PROFILE=1` prints this).
+faster when both heads are needed. Of a 300 s run: feed-forward 26 s, attention 32 s (25 s of it the scores,
+softmax and weighted values, at about 80% of the FMA peak), convolution module 6 s, ConvNeXt stages 5 s, heads 3 s
+(`SHEETSAGE_PROFILE=1` prints this, and the peak memory per part).
+
+Memory, for a server: the weights are a memory-mapped file, so they live in the page cache, shared by every process
+that maps the same file and reclaimable by the kernel (`--dtype i8` halves them to 0.6 GB, but moved a bar line of
+the 330 s synthetic song: check it on real music first). A request's own memory is about 220 MB for 5 minutes of
+audio (75 MB for one minute): the 25 encoder states are never kept (each is added into the heads' layer mixes),
+q / k / v, the convolution module and the ConvNeXt layers run per block of rows, attention's output overwrites q,
+and the beat tracker's back pointers are one byte each. The engine gives freed memory back to the system after each
+song (`malloc_trim`), 16 MB between songs.
 
 A Ryzen 9 5900HX (8 Zen 3 cores, 2 x 256-bit FMA each) has about three times the FMA throughput of this machine, so
 a 5-minute song should take 20-30 s there; measure it with:

@@ -368,7 +368,15 @@ fn viterbi(
     let (nbk, nt, nb) = (n.k0.len(), n.taus.len(), n.last.len());
     let size = n.size;
     let mut buf = vec![-((nbk * size) as f64).ln(); nbk * size];
-    let mut back = vec![0i32; frames * nbk * nt];
+    // Back pointers, one byte each: the interval a state's beat came from (top bit: through a hold); the row is
+    // the one before for a bar's inner beats, and for a bar's first beat the last of the metre in `metre_back`.
+    assert!(nt < 128 && nb < 256, "too many intervals or meters for one-byte back pointers");
+    let mut back = vec![0u8; frames * nbk * nt];
+    let mut metre_back = vec![0u8; frames * nb * nt];
+    let mut metre_of = vec![0usize; nbk];
+    for (m, &f) in n.first.iter().enumerate() {
+        metre_of[f] = m;
+    }
     let mut end = vec![0.0f64; nbk * nt];
     let mut start = vec![0.0f64; nbk * nt];
     let mut tbest = vec![0.0f64; nb * nt];
@@ -380,7 +388,7 @@ fn viterbi(
     let (mut best, mut args) = (vec![0.0f64; beat_src.stride], vec![0.0f64; beat_src.stride]);
     const SLOTS: usize = 2 + 2 * HALF; // the new beat's slot, then HALF + 1 after it and HALF before the next
     let mut slots = vec![0usize; nt * SLOTS];
-    let off = (nbk * nt) as i32;
+    const HELD: u8 = 0x80;
     let l_go = (1.0 - p_hold).ln();
     let l_enter = if use_hold { p_hold.ln() } else { f64::NEG_INFINITY };
     let (l_stay, l_exit) =
@@ -409,7 +417,7 @@ fn viterbi(
             start[r * nt..(r + 1) * nt].copy_from_slice(&best[..nt]);
             for j in 0..nt {
                 let arg = args[j] as usize;
-                back_t[r * nt + j] = ((r - 1) * nt + arg) as i32 + if via[(r - 1) * nt + arg] { off } else { 0 };
+                back_t[r * nt + j] = arg as u8 | if via[(r - 1) * nt + arg] { HELD } else { 0 };
             }
         }
         for m in 0..nb {
@@ -432,7 +440,8 @@ fn viterbi(
                 let f = n.first[m2];
                 start[f * nt + j] = best;
                 let (lr, tj) = (n.last[arg], targ[arg * nt + j]);
-                back_t[f * nt + j] = (lr * nt + tj) as i32 + if via[lr * nt + tj] { off } else { 0 };
+                back_t[f * nt + j] = tj as u8 | if via[lr * nt + tj] { HELD } else { 0 };
+                metre_back[(t * nb + m2) * nt + j] = arg as u8;
             }
         }
         // the slots of positions 0..=HALF (just after the beat) and tau - HALF..tau (just before the next), per
@@ -492,10 +501,12 @@ fn viterbi(
         if n.is_first[row] {
             downs.push(t0 as usize);
         }
-        let mut prev = back[(t0 as usize * nbk + row) * nt + j];
-        let held = prev >= off;
-        prev %= off;
-        (row, j) = (prev as usize / nt, prev as usize % nt);
+        let t0u = t0 as usize;
+        let prev = back[(t0u * nbk + row) * nt + j];
+        let held = prev & HELD != 0;
+        let prev_row =
+            if n.is_first[row] { n.last[metre_back[(t0u * nb + metre_of[row]) * nt + j] as usize] } else { row - 1 };
+        (row, j) = (prev_row, (prev & !HELD) as usize);
         t = t0 - 1;
         if held {
             while t > 0 && stay[(t as usize * nbk + row) * nt + j] {

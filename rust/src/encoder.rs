@@ -259,49 +259,61 @@ impl Encoder {
         });
     }
 
+    /// `x += out(attention(norm(x)))`.  q, k and v are made per block of rows: q goes to `s.rows` (where attention
+    /// leaves its output), the rotated keys and the values straight into their per-head layouts.
     fn attention(&self, b: &Block, x: &mut [f32], frames: usize, s: &mut Scratch) {
         const QKV: usize = 3 * WIDTH;
-        normalize_rows(x, &mut s.norm, WIDTH, EPS);
-        gemm::linear(&s.norm, WIDTH, frames, &b.qkv, &mut s.wide, QKV, Act::None, false, None);
-        // Rotary positions on q and k (`RotarySelfAttention`), then k transposed per head for the score kernel.
         let half = HEAD_DIM / 2;
         let (cos, sin) = (self.rope_cos, self.rope_sin);
-        s.wide[..frames * QKV].par_chunks_mut(QKV).enumerate().for_each(|(t, row)| {
-            let (c, si) = (&cos[t * half..(t + 1) * half], &sin[t * half..(t + 1) * half]);
-            for head in 0..2 * HEADS {
-                let v = &mut row[head * HEAD_DIM..(head + 1) * HEAD_DIM];
-                for i in 0..half {
-                    let (a, b) = (v[i], v[i + half]);
-                    v[i] = a * c[i] - b * si[i];
-                    v[i + half] = b * c[i] + a * si[i];
+        let padded = s.padded;
+        let (q_out, keys_out, values_out) =
+            (SendPtr(s.rows.as_mut_ptr()), SendPtr(s.keys.as_mut_ptr()), SendPtr(s.values.as_mut_ptr()));
+        let block = gemm::rows().div_ceil(NR) * NR; // whole key panels per block
+        x[..frames * WIDTH].par_chunks(block * WIDTH).enumerate().for_each(|(i, x)| {
+            let (t0, rows) = (i * block, x.len() / WIDTH);
+            let mut norm = vec![0.0f32; rows * WIDTH];
+            for (o, row) in norm.chunks_mut(WIDTH).zip(x.chunks(WIDTH)) {
+                math::normalize(row, o, EPS);
+            }
+            let mut qkv = vec![0.0f32; rows * QKV];
+            gemm::linear_block(&norm, WIDTH, rows, &b.qkv, &mut qkv, QKV, Act::None, false, None);
+            for (r, row) in qkv.chunks_mut(QKV).enumerate() {
+                let t = t0 + r;
+                // rotary positions on q and k (`RotarySelfAttention`)
+                let (c, si) = (&cos[t * half..(t + 1) * half], &sin[t * half..(t + 1) * half]);
+                for head in 0..2 * HEADS {
+                    let v = &mut row[head * HEAD_DIM..(head + 1) * HEAD_DIM];
+                    for i in 0..half {
+                        let (a, b) = (v[i], v[i + half]);
+                        v[i] = a * c[i] - b * si[i];
+                        v[i + half] = b * c[i] + a * si[i];
+                    }
+                }
+                // Each block writes its own rows of q, and of every head's keys (whole panels) and values.
+                unsafe {
+                    std::slice::from_raw_parts_mut(q_out.get().add(t * WIDTH), WIDTH).copy_from_slice(&row[..WIDTH]);
+                    for head in 0..HEADS {
+                        let k = &row[WIDTH + head * HEAD_DIM..][..HEAD_DIM];
+                        let panel = keys_out.get().add(head * HEAD_DIM * padded + (t / NR) * HEAD_DIM * NR + t % NR);
+                        for (d, &v) in k.iter().enumerate() {
+                            *panel.add(d * NR) = v;
+                        }
+                        let v = &row[2 * WIDTH + head * HEAD_DIM..][..HEAD_DIM];
+                        std::slice::from_raw_parts_mut(values_out.get().add((head * padded + t) * HEAD_DIM), HEAD_DIM)
+                            .copy_from_slice(v);
+                    }
                 }
             }
         });
-        // Keys in 16-key panels `[panel][HEAD_DIM][16]` and values `[key][HEAD_DIM]`, per head and contiguous.
-        let padded = s.padded;
-        let wide = &s.wide;
-        s.keys.par_chunks_mut(HEAD_DIM * padded).zip(s.values.par_chunks_mut(HEAD_DIM * padded)).enumerate().for_each(
-            |(head, (keys, values))| {
-                for t in 0..frames {
-                    let k = &wide[t * QKV + WIDTH + head * HEAD_DIM..][..HEAD_DIM];
-                    let panel = &mut keys[(t / NR) * HEAD_DIM * NR..][..HEAD_DIM * NR];
-                    for d in 0..HEAD_DIM {
-                        panel[d * NR + t % NR] = k[d];
-                    }
-                    values[t * HEAD_DIM..(t + 1) * HEAD_DIM]
-                        .copy_from_slice(&wide[t * QKV + 2 * WIDTH + head * HEAD_DIM..][..HEAD_DIM]);
-                }
-            },
-        );
-        crate::profile::time("attention core", || attend(&s.wide, &s.keys, &s.values, padded, frames, &mut s.norm));
-        gemm::linear(&s.norm, WIDTH, frames, &b.out, x, WIDTH, Act::None, true, None);
+        crate::profile::time("attention core", || attend(&mut s.rows, &s.keys, &s.values, padded, frames));
+        gemm::linear(&s.rows, WIDTH, frames, &b.out, x, WIDTH, Act::None, true, None);
     }
 }
 
-/// Buffers reused by every block of one window.
+/// Buffers reused by every block of one window: `[frames, WIDTH]` rows (q, then attention's output, then the
+/// convolution module's GLU output) and the keys and values (the latter also the convolution module's output).
 struct Scratch {
-    norm: Vec<f32>,   // [frames, WIDTH]: normalised rows, then attention's output
-    wide: Vec<f32>,   // [frames + MR, 3 WIDTH]: q k v, then the convolution module's input
+    rows: Vec<f32>,   // [frames + MR, WIDTH]
     keys: Vec<f32>,   // [HEADS][padded / 16][HEAD_DIM][16]: rotated keys in panels of 16
     values: Vec<f32>, // [HEADS][padded][HEAD_DIM]
     padded: usize,    // frames rounded up to a whole panel
@@ -311,8 +323,7 @@ impl Scratch {
     fn new(frames: usize) -> Self {
         let padded = frames.div_ceil(NR) * NR;
         Self {
-            norm: vec![0.0; frames * WIDTH],
-            wide: vec![0.0; (frames + MR) * 3 * WIDTH],
+            rows: vec![0.0; (frames + MR) * WIDTH],
             keys: vec![0.0; HEADS * HEAD_DIM * padded],
             values: vec![0.0; HEADS * HEAD_DIM * padded],
             padded,
@@ -341,12 +352,14 @@ fn feed_forward(x: &mut [f32], frames: usize, (fc1, fc2): &(Linear, Linear)) {
 
 /// Scaled dot-product attention of all heads (scale folded into q), flash-style: per head and block of `QB` query
 /// rows the keys are visited in blocks of `KB` with a running max and sum.  `out` is `[frames, WIDTH]`.
-pub fn attend(qkv: &[f32], keys: &[f32], values: &[f32], padded: usize, frames: usize, out: &mut [f32]) {
+/// `qo` holds q `[frames + MR, WIDTH]` (the last MR rows padding) and gets the output in its place: each task reads
+/// only its own rows of its own head and writes them when it is done with them.
+pub fn attend(qo: &mut [f32], keys: &[f32], values: &[f32], padded: usize, frames: usize) {
     const QB: usize = 16 * MR;
     const KB: usize = 256;
-    const QKV: usize = 3 * WIDTH;
+    assert!(qo.len() >= (frames + MR) * WIDTH);
     let blocks = frames.div_ceil(QB);
-    let out_ptr = SendPtr(out.as_mut_ptr());
+    let out_ptr = SendPtr(qo.as_mut_ptr());
     (0..HEADS * blocks).into_par_iter().for_each(|task| {
         let (head, qb) = (task / blocks, task % blocks);
         let q0 = qb * QB;
@@ -358,15 +371,17 @@ pub fn attend(qkv: &[f32], keys: &[f32], values: &[f32], padded: usize, frames: 
         let mut acc = vec![0.0f32; QB * HEAD_DIM];
         let mut max = vec![f32::NEG_INFINITY; QB];
         let mut sum = vec![0.0f32; QB];
-        let q = &qkv[q0 * QKV + head * HEAD_DIM..];
+        let q_len = (row_panels * MR - 1) * WIDTH + HEAD_DIM;
         for k0 in (0..frames).step_by(KB) {
             let kb = KB.min(frames - k0);
+            // The task's q rows, read only while no output is written.
+            let q = unsafe { std::slice::from_raw_parts(out_ptr.get().add(q0 * WIDTH + head * HEAD_DIM), q_len) };
             // scores[r, j] = q_r . k_(k0 + j)
             for rp in 0..row_panels {
                 for cp in 0..kb.div_ceil(NR) {
                     let panel = &keys[(k0 / NR + cp) * HEAD_DIM * NR..][..HEAD_DIM * NR];
                     let c = &mut scores[rp * MR * KB + cp * NR..];
-                    gemm::kernel_into(HEAD_DIM, &q[rp * MR * QKV..], QKV, 1, panel, NR, c, KB, false);
+                    gemm::kernel_into(HEAD_DIM, &q[rp * MR * WIDTH..], WIDTH, 1, panel, NR, c, KB, false);
                 }
             }
             for r in 0..rows {
@@ -492,29 +507,40 @@ impl SendPtr {
     }
 }
 
-/// `x += pw_out(gelu(norm(depthwise(glu(pw_in(norm(x)))))))` (`ConvolutionModule`).
+/// `x += pw_out(gelu(norm(depthwise(glu(pw_in(norm(x)))))))` (`ConvolutionModule`): the GLU output per block of rows
+/// into `s.rows`, the depthwise convolution's into `s.values` (free again after attention).
 fn conv_module(b: &Block, x: &mut [f32], frames: usize, s: &mut Scratch) {
     const IN: usize = 2 * WIDTH;
-    normalize_rows(x, &mut s.norm, WIDTH, EPS);
-    gemm::linear(&s.norm, WIDTH, frames, &b.pw_in, &mut s.wide, IN, Act::None, false, None);
-    s.wide[..frames * IN].par_chunks_mut(IN).for_each(|row| {
-        let (a, gate) = row.split_at_mut(WIDTH);
-        for (a, g) in a.iter_mut().zip(gate.iter()) {
-            *a *= math::sigmoid(*g);
-        }
-    });
+    let block = gemm::rows();
+    s.rows[..frames * WIDTH].par_chunks_mut(block * WIDTH).zip(x[..frames * WIDTH].par_chunks(block * WIDTH)).for_each(
+        |(glu, x)| {
+            let rows = x.len() / WIDTH;
+            let mut norm = vec![0.0f32; rows * WIDTH];
+            for (o, row) in norm.chunks_mut(WIDTH).zip(x.chunks(WIDTH)) {
+                math::normalize(row, o, EPS);
+            }
+            let mut wide = vec![0.0f32; rows * IN];
+            gemm::linear_block(&norm, WIDTH, rows, &b.pw_in, &mut wide, IN, Act::None, false, None);
+            for (o, row) in glu.chunks_mut(WIDTH).zip(wide.chunks(IN)) {
+                let (a, gate) = row.split_at(WIDTH);
+                for ((o, a), g) in o.iter_mut().zip(a).zip(gate) {
+                    *o = a * math::sigmoid(*g);
+                }
+            }
+        },
+    );
     let taps = b.dw_w.len() / WIDTH;
     let half = (taps / 2) as isize;
-    let glu = &s.wide;
+    let glu = &s.rows;
     let (g, beta) = b.dw_norm;
-    s.norm[..frames * WIDTH].par_chunks_mut(WIDTH).enumerate().for_each(|(t, o)| {
+    s.values[..frames * WIDTH].par_chunks_mut(WIDTH).enumerate().for_each(|(t, o)| {
         o.fill(0.0);
         for j in 0..taps {
             let src = t as isize + j as isize - half;
             if src < 0 || src >= frames as isize {
                 continue;
             }
-            let row = &glu[src as usize * IN..src as usize * IN + WIDTH];
+            let row = &glu[src as usize * WIDTH..(src as usize + 1) * WIDTH];
             for ((o, w), v) in o.iter_mut().zip(&b.dw_w[j * WIDTH..(j + 1) * WIDTH]).zip(row) {
                 *o += w * v;
             }
@@ -523,7 +549,7 @@ fn conv_module(b: &Block, x: &mut [f32], frames: usize, s: &mut Scratch) {
         math::layer_norm(&copy, o, g, beta, EPS);
         math::gelu_slice(o);
     });
-    gemm::linear(&s.norm, WIDTH, frames, &b.pw_out, x, WIDTH, Act::None, true, None);
+    gemm::linear(&s.values, WIDTH, frames, &b.pw_out, x, WIDTH, Act::None, true, None);
 }
 
 /// LayerNorm each frame of `x` `[frames, cin]` (scale and shift folded) and apply the stride-2 convolution as one
@@ -540,26 +566,32 @@ fn downsample(x: &[f32], frames: usize, cin: usize, down: &Linear) -> (Vec<f32>,
 /// `x += fc2(grn(gelu(fc1(norm(depthwise(x))))))` (`ConvNeXtLayer`).  GRN's gain per channel needs the whole
 /// window, so the hidden rows are kept; GRN's shift is folded into fc2's bias and its gain scales fc2's input.
 fn convnext_layer(x: &mut [f32], frames: usize, c: usize, l: &ConvNeXtLayer) {
-    let mut y = vec![0.0f32; frames * c];
-    y.par_chunks_mut(c).enumerate().for_each(|(t, o)| {
-        o.copy_from_slice(l.dw_b);
-        for j in 0..7 {
-            let src = t as isize + j as isize - 3;
-            if src < 0 || src >= frames as isize {
-                continue;
-            }
-            let row = &x[src as usize * c..(src as usize + 1) * c];
-            for ((o, w), v) in o.iter_mut().zip(&l.dw_w[j * c..(j + 1) * c]).zip(row) {
-                *o += w * v;
-            }
-        }
-        let copy = o.to_vec();
-        math::normalize(&copy, o, STAGE_EPS);
-    });
+    // depthwise convolution, norm, fc1 and GELU per block of rows; GRN needs all of them before fc2
     let hidden_width = l.fc1.n;
     let mut hidden = vec![0.0f32; frames * hidden_width];
-    gemm::linear(&y, c, frames, &l.fc1, &mut hidden, hidden_width, Act::Gelu, false, None);
-    drop(y);
+    let block = gemm::rows();
+    let input = &*x;
+    hidden.par_chunks_mut(block * hidden_width).enumerate().for_each(|(i, hidden)| {
+        let (t0, rows) = (i * block, hidden.len() / hidden_width);
+        let mut y = vec![0.0f32; rows * c];
+        for (r, o) in y.chunks_mut(c).enumerate() {
+            let t = t0 + r;
+            o.copy_from_slice(l.dw_b);
+            for j in 0..7 {
+                let src = t as isize + j as isize - 3;
+                if src < 0 || src >= frames as isize {
+                    continue;
+                }
+                let row = &input[src as usize * c..(src as usize + 1) * c];
+                for ((o, w), v) in o.iter_mut().zip(&l.dw_w[j * c..(j + 1) * c]).zip(row) {
+                    *o += w * v;
+                }
+            }
+            let copy = o.to_vec();
+            math::normalize(&copy, o, STAGE_EPS);
+        }
+        gemm::linear_block(&y, c, rows, &l.fc1, hidden, hidden_width, Act::Gelu, false, None);
+    });
     let squares = hidden
         .par_chunks(hidden_width * 64)
         .map(|rows| {

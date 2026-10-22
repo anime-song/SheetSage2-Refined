@@ -121,7 +121,7 @@ pub fn linear_block(
                 let cols = NR.min(lin.n - n0);
                 for rp in 0..row_panels {
                     let rows = MR.min(m - rp * MR);
-                    if rows == MR && cols == NR && lin.scale.is_none() {
+                    if rows == MR && cols == NR {
                         // a whole tile: the kernel adds straight into `out`, the bias and GELU follow on the last slice
                         let c = &mut out[rp * MR * ldo + n0..];
                         kernel_into(kc, &apack[rp * MR * kc..], 1, MR, b, ldb, c, ldo, !(first && !accumulate));
@@ -137,11 +137,10 @@ pub fn linear_block(
                         continue;
                     }
                     kernel(kc, &apack[rp * MR * kc..], 1, MR, b, ldb, &mut tile);
-                    let scale = lin.scale.map(|s| &s[n0..n0 + cols]);
                     for r in 0..rows {
                         let o = &mut out[(rp * MR + r) * ldo + n0..][..cols];
                         let t = &tile[r * NR..r * NR + cols];
-                        epilogue(o, t, scale, &lin.bias[n0..n0 + cols], first && !accumulate, last, act);
+                        epilogue(o, t, &lin.bias[n0..n0 + cols], first && !accumulate, last, act);
                     }
                 }
             }
@@ -150,12 +149,9 @@ pub fn linear_block(
 }
 
 #[inline]
-fn epilogue(o: &mut [f32], t: &[f32], scale: Option<&[f32]>, bias: &[f32], overwrite: bool, last: bool, act: Act) {
+fn epilogue(o: &mut [f32], t: &[f32], bias: &[f32], overwrite: bool, last: bool, act: Act) {
     for j in 0..o.len() {
         let mut v = t[j];
-        if let Some(s) = scale {
-            v *= s[j];
-        }
         if !overwrite {
             v += o[j];
         }
@@ -208,8 +204,17 @@ fn panel_slice<'a>(lin: &'a Linear, panel: usize, k0: usize, kc: usize, buf: &'a
             (&buf[..kc * NR], NR)
         }
         Panels::I8(w) => {
-            for (d, &s) in buf[..kc * NR].iter_mut().zip(&w[start..start + kc * NR]) {
-                *d = s as f32;
+            // the output channels' scales go into the converted panel, so the products need none
+            let n0 = panel * NR;
+            let mut scale = [0.0f32; NR];
+            if let Some(s) = lin.scale {
+                let cols = NR.min(lin.n - n0);
+                scale[..cols].copy_from_slice(&s[n0..n0 + cols]);
+            }
+            for (d, s) in buf[..kc * NR].chunks_exact_mut(NR).zip(w[start..start + kc * NR].chunks_exact(NR)) {
+                for ((d, &s), g) in d.iter_mut().zip(s).zip(&scale) {
+                    *d = s as f32 * g;
+                }
             }
             (&buf[..kc * NR], NR)
         }
@@ -366,6 +371,33 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn f16_and_int8_panels_match_naive() {
+        let (m, n, k) = (13, 37, 300);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i * 7919) % 101) as f32 / 50.0 - 1.0).collect();
+        let w: Vec<f32> = (0..n * k).map(|i| ((i * 104729) % 97) as f32 / 48.0 - 1.0).collect();
+        let packed = pack(&w, n, k);
+        let scale: Vec<f32> = (0..n).map(|j| (0..k).map(|p| w[j * k + p].abs()).fold(0.0, f32::max) / 127.0).collect();
+        let mut q = vec![0i8; packed.len()];
+        for (i, (q, v)) in q.iter_mut().zip(&packed).enumerate() {
+            let j = (i / (k * NR)) * NR + i % NR;
+            *q = if j < n { (v / scale[j]).round() as i8 } else { 0 };
+        }
+        let h: Vec<u16> = packed.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+        let bias = leak(vec![0.5f32; n]);
+        for (w_panels, s, tol) in [(Panels::F16(leak(h)), None, 1e-2), (Panels::I8(leak(q)), Some(leak(scale)), 5e-2)] {
+            let lin = Linear { n, k, w: w_panels, scale: s, bias };
+            let mut out = vec![0.0; m * n];
+            linear(&a, k, m, &lin, &mut out, n, Act::None, false, None);
+            for i in 0..m {
+                for j in 0..n {
+                    let want: f64 = (0..k).map(|p| a[i * k + p] as f64 * w[j * k + p] as f64).sum::<f64>() + 0.5;
+                    assert!((out[i * n + j] as f64 - want).abs() < tol * (1.0 + want.abs()), "{i} {j}");
+                }
+            }
+        }
     }
 
     #[test]

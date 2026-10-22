@@ -49,9 +49,16 @@ pub fn beat_probs(outputs: &Outputs) -> Result<BeatProbs, String> {
     })
 }
 
-pub fn beats_json(outputs: &Outputs, audio: &str, duration: f64, tempo_weight: f64) -> Result<Value, String> {
+/// `options`: the beat tracker's settings (`beats --hold` is `p_hold`).
+pub fn beats_json(
+    outputs: &Outputs,
+    audio: &str,
+    duration: f64,
+    options: &Options,
+    tempo_weight: f64,
+) -> Result<Value, String> {
     let probs = beat_probs(outputs)?;
-    let t = tracker::track_beats(&probs, &Options::default(), tempo_weight);
+    let t = tracker::track_beats(&probs, options, tempo_weight);
     let bars: Vec<Value> = t
         .bars
         .iter()

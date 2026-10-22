@@ -10,10 +10,14 @@ fn enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("SHEETSAGE_PROFILE").is_some_and(|v| v != "0"))
 }
 
+/// The part of the model running now (for `MemoryWatch`'s peaks per part).
+pub static PHASE: Mutex<&'static str> = Mutex::new("");
+
 pub fn time<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     if !enabled() {
         return f();
     }
+    *PHASE.lock().unwrap() = name;
     let start = Instant::now();
     let out = f();
     let elapsed = start.elapsed().as_secs_f64();

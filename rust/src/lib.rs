@@ -63,10 +63,69 @@ impl Model {
     }
 }
 
-/// Peak resident memory of this process in MiB (Linux), if known.
-pub fn peak_rss_mib() -> Option<f64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+/// Give the memory a request freed back to the system (glibc keeps freed blocks in its per-thread arenas, so a
+/// long-running process would otherwise sit at its peak between requests).
+pub fn release_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+fn status_mib(status: &str, key: &str) -> Option<f64> {
+    let line = status.lines().find(|l| l.starts_with(key))?;
     let kib: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
     Some(kib / 1024.0)
+}
+
+/// Peak resident memory of this process in MiB (Linux), if known.
+pub fn peak_rss_mib() -> Option<f64> {
+    status_mib(&std::fs::read_to_string("/proc/self/status").ok()?, "VmHWM:")
+}
+
+/// Samples this process's resident memory (Linux) every few milliseconds until `stop`: the peak of its own
+/// allocations (`RssAnon`, what a request costs) and of the mapped weights (`RssFile`, page cache that other
+/// processes mapping the same file share and the kernel can reclaim).
+pub struct MemoryWatch {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<(f64, f64)>,
+}
+
+impl MemoryWatch {
+    pub fn start() -> Self {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        let thread = std::thread::spawn(move || {
+            let (mut anon, mut file) = (0.0f64, 0.0f64);
+            let mut phases: Vec<(&'static str, f64)> = Vec::new();
+            loop {
+                if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+                    let a = status_mib(&status, "RssAnon:").unwrap_or(0.0);
+                    anon = anon.max(a);
+                    file = file.max(status_mib(&status, "RssFile:").unwrap_or(0.0));
+                    let phase = *profile::PHASE.lock().unwrap();
+                    match phases.iter_mut().find(|(p, _)| *p == phase) {
+                        Some((_, m)) => *m = m.max(a),
+                        None => phases.push((phase, a)),
+                    }
+                }
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::env::var_os("SHEETSAGE_PROFILE").is_some() {
+                        for (p, m) in &phases {
+                            eprintln!("  peak memory in {p:16} {m:6.0} MiB");
+                        }
+                    }
+                    return (anon, file);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        Self { done, thread }
+    }
+
+    /// `(peak RssAnon, peak RssFile)` in MiB.
+    pub fn stop(self) -> (f64, f64) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.join().unwrap_or((f64::NAN, f64::NAN))
+    }
 }

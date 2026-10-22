@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--binary", type=Path, default=cpu.DEFAULT_BINARY)
     parser.add_argument("--noise", type=float, default=0.0)
     parser.add_argument("--copies", type=int, default=3)
+    parser.add_argument("--hold", type=float, default=0.0, help="the beat tracker's p_hold (fermatas)")
     args = parser.parse_args()
     tmp = Path(tempfile.mkdtemp())
     files = []
@@ -46,8 +47,8 @@ def main():
             save_file(noisy, str(files[-1]), metadata=meta)
     out = tmp / "rust"
     subprocess.run([str(args.binary), "--weights", str(args.weights), "--out-dir", str(out), "--from-logits",
-                    *map(str, files)], check=True, capture_output=True)  # fmt: skip
-    beats, melody = cpu.trackers(args.weights)
+                    "--hold", str(args.hold), *map(str, files)], check=True, capture_output=True)  # fmt: skip
+    beats, melody = cpu.trackers(args.weights, p_hold=args.hold)
     failures = 0
     for path in files:
         stem = path.name.removesuffix(".heads.safetensors")

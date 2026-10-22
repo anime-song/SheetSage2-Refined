@@ -390,6 +390,7 @@ name = "sheetsage2-cpu"
 version = "0.1.0"
 dependencies = [
  "half",
+ "libc",
  "memmap2",
  "rayon",
  "realfft",
