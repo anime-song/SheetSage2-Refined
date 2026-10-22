@@ -22,7 +22,7 @@ pub const MR: usize = 6;
 pub const NR: usize = PANEL;
 
 // Blocking: rows per parallel block (a multiple of MR) and the slice of k per packed panel.  A KC of 256 keeps a
-// converted weight panel (16 KiB) in a Zen 3 core's 32 KiB L1 next to the streamed rows.  `SHEETSAGE_ROWS` and
+// converted weight panel (16 KiB) in a 32 KiB L1 data cache next to the streamed rows.  `SHEETSAGE_ROWS` and
 // `SHEETSAGE_KC` override them (`examples/bench.rs --tune` searches for the best pair on a machine).
 static ROWS: AtomicUsize = AtomicUsize::new(0);
 static KC: AtomicUsize = AtomicUsize::new(0);

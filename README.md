@@ -117,7 +117,7 @@ result["notes"]   # [{"start": 12.34, "end": 12.58, "pitch": 67, "track": 0, "st
 ### On the CPU (Rust engine, no Python at run time)
 
 `rust/` runs the encoder, the beat and melody heads and both trackers on the CPU with its own AVX2 + FMA kernels
-(any x86-64 CPU from Zen 2 / Haswell on; others fall back to slower portable code). It reads one file that
+(any x86-64 CPU with AVX2 and FMA; others fall back to slower portable code). It reads one file that
 `export_cpu` folds and packs the weights into, by default as float16 (1.2 GB; `--dtype i8` makes it 0.6 GB):
 
 ```bash
@@ -129,7 +129,7 @@ rust/target/release/sheetsage2-cpu --weights cpu.safetensors song.mp3   # -> out
 
 The JSON is what `beats` and `melody` write. `--adapter my.lora.safetensors` applies a LoRA adapter at run time
 next to the unchanged base export (a few to a few tens of MiB per adapter, swappable between songs). Built with `--features gpu`, `--device gpu` runs the encoder on a GPU
-through Vulkan (made for integrated GPUs such as a Ryzen's Radeon). See [rust/README.md](rust/README.md) for how it
+through Vulkan (made for integrated GPUs). See [rust/README.md](rust/README.md) for how it
 works, its accuracy against PyTorch, speed and tuning.
 
 ## License

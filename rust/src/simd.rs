@@ -1,4 +1,4 @@
-//! Runtime CPU feature detection.  The AVX2 + FMA (+ F16C) kernels are the ones a Zen 2 / Zen 3 Ryzen runs;
+//! Runtime CPU feature detection.  The AVX2 + FMA (+ F16C) kernels are the fast path;
 //! everything else falls back to portable scalar code.  `SHEETSAGE_NO_SIMD=1` forces the fallback (for tests).
 
 use std::sync::OnceLock;

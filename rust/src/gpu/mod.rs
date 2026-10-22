@@ -1,7 +1,7 @@
 //! The encoder on a GPU through wgpu (Vulkan on Linux; built with `--features gpu`): the same computation as
 //! `encoder.rs` in WGSL compute shaders, float16 weights (the CPU engine's 16-column panels) and float32 arithmetic.
 //! The log-mel spectrogram is computed on the CPU and the layer mixes are read back for the heads, which also run
-//! on the CPU.  Made for integrated GPUs such as a Ryzen's Radeon, which share the system's memory: all buffers are
+//! on the CPU.  Made for integrated GPUs, which share the system's memory: all buffers are
 //! allocated once for the longest window and reused, about 280 MB of activations next to 1.2 GB of weights.
 
 use std::borrow::Cow;

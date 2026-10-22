@@ -16,7 +16,7 @@ writes `<out-dir>/<song>.beats.json` and `<song>.melody.json` (default `outputs/
 `python -m sheetsage2_refined.beats` / `.melody` do; `--logits` also writes the heads' logits
 (`<song>.heads.safetensors`) and `--from-logits` runs only the trackers on such files.
 
-`--threads` defaults to one per logical CPU; on a Ryzen try the number of physical cores (8 on a 5900HX) as well.
+`--threads` defaults to one per logical CPU; on a CPU with SMT try the number of physical cores as well.
 WAV, FLAC, MP3 and Ogg Vorbis are decoded by Symphonia and resampled to 24 kHz as `torchaudio.functional.resample`
 does; a `.f32` file is taken as raw float32 samples, mono at 24 kHz.
 
@@ -58,9 +58,9 @@ per row, flash-style attention 32 queries x 32 keys at a time. GPU memory (on an
 weights is dropped after the upload. The work is submitted a block at a time, so no submission runs long enough
 for the driver to reset the GPU.
 
-Developed without the GPU it is meant for: checked on Mesa's software Vulkan (llvmpipe), where the logits of a
-60 s synthetic song are within 5e-4 of the CPU engine's (beats, bars and notes identical) and `gpu_bench`'s linear
-layers and attention on a whole 300 s window within 2e-5. Its speed has to be measured on the real GPU:
+Checked on Mesa's software Vulkan (llvmpipe): the logits of a 60 s synthetic song are within 5e-4 of the CPU
+engine's (beats, bars and notes identical) and `gpu_bench`'s linear layers and attention on a whole 300 s window
+within 2e-5. Its speed has to be measured on the GPU it runs on:
 `SHEETSAGE_PROFILE=1` prints the GPU time per part (it waits for the GPU after each, so the total grows a little).
 
 ## How it works
@@ -71,8 +71,8 @@ layers and attention on a whole 300 s window within 2e-5. Its speed has to be me
   reads them, as float16, float32 or int8 (scale per output channel), and the file is memory-mapped.
 * Matrix products (`src/gemm.rs`) are BLIS-style: rows in parallel blocks, packed into 6-row panels per slice of `k`,
   each weight panel converted to float32 once per block and swept by a 6x16 AVX2 micro-kernel (12 accumulators)
-  that adds straight into the output. `llvm-mca -mcpu=znver3` puts its inner loop at 6 cycles for 12 FMAs: Zen 3's
-  FMA peak.
+  that adds straight into the output: `llvm-mca` puts its inner loop at 12 FMAs in 6 cycles, the FMA peak of a
+  core with two 256-bit FMA units.
 * Attention (`src/encoder.rs`) is flash-style: per head and block of 96 queries, keys in blocks of 256 with a running
   max and sum, so no frames x frames matrix exists. Probabilities below e^-40 of a row's best are flushed to zero and
   every thread runs with FTZ / DAZ: products of tiny probabilities and values are denormal numbers, which made
@@ -104,13 +104,13 @@ Python ones on the logits of both songs and on 20 noisy copies (noise up to 3 on
 
 ## Speed and memory
 
-On the 4-vCPU cloud machine it was developed on (Intel Xeon, AVX2 code path only, timings vary by 5-10% from run to
-run), float16 weights, a 300 s song:
+With the AVX2 code path and float16 weights, a 300 s song (times depend on the CPU; the comparison is on one
+machine):
 
 | | time | memory |
 |---|---|---|
 | this engine: encoder + both heads + both trackers | 69 s + 1.4 s | 217 MB own + 1.2 GB mapped weights |
-| PyTorch, AVX2 only (as on a Zen 3): encoder + beat head | 70 s, again for the melody head | 5.5 GB |
+| PyTorch, AVX2 only: encoder + beat head | 70 s, again for the melody head | 5.5 GB |
 | PyTorch with AVX-512: encoder + beat head | 49 s, again for the melody head | 5.5 GB |
 
 Per encoder pass the engine is about as fast as PyTorch's MKL / oneDNN kernels on the same instruction set; it is
@@ -126,11 +126,10 @@ q / k / v, the convolution module and the ConvNeXt layers run per block of rows,
 and the beat tracker's back pointers are one byte each. The engine gives freed memory back to the system after each
 song (`malloc_trim`), 16 MB between songs.
 
-A Ryzen 9 5900HX (8 Zen 3 cores, 2 x 256-bit FMA each) has about three times the FMA throughput of this machine, so
-a 5-minute song should take 20-30 s there; measure it with:
+To measure and tune it on a machine (N threads):
 
 ```bash
-cargo run --release --example bench -- --threads 8 --tune     # kernel peak, linear layers, best SHEETSAGE_ROWS / SHEETSAGE_KC
-cargo run --release --example attention -- 7500 8 --sharp 20  # the attention core on a 300 s window
-SHEETSAGE_PROFILE=1 ./target/release/sheetsage2-cpu --threads 8 --weights cpu.safetensors song.wav
+cargo run --release --example bench -- --threads N --tune     # kernel peak, linear layers, best SHEETSAGE_ROWS / SHEETSAGE_KC
+cargo run --release --example attention -- 7500 N --sharp 20  # the attention core on a 300 s window
+SHEETSAGE_PROFILE=1 ./target/release/sheetsage2-cpu --threads N --weights cpu.safetensors song.wav
 ```

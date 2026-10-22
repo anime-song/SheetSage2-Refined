@@ -49,7 +49,7 @@ fn main() {
     let mut out = vec![0.0f32; m * 4096];
     let mut run = |lin: &Linear| {
         gemm::linear(&x, lin.k, m, lin, &mut out, lin.n, Act::None, false, None);
-        // the best of several runs: the cloud machines this was tuned on are noisy
+        // the best of several runs: single timings are noisy
         let mut best = f64::INFINITY;
         for _ in 0..7 {
             let start = Instant::now();
