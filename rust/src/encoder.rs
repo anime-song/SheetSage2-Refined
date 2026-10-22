@@ -341,7 +341,7 @@ fn feed_forward(x: &mut [f32], frames: usize, (fc1, fc2): &(Linear, Linear)) {
 
 /// Scaled dot-product attention of all heads (scale folded into q), flash-style: per head and block of `QB` query
 /// rows the keys are visited in blocks of `KB` with a running max and sum.  `out` is `[frames, WIDTH]`.
-fn attend(qkv: &[f32], keys: &[f32], values: &[f32], padded: usize, frames: usize, out: &mut [f32]) {
+pub fn attend(qkv: &[f32], keys: &[f32], values: &[f32], padded: usize, frames: usize, out: &mut [f32]) {
     const QB: usize = 16 * MR;
     const KB: usize = 256;
     const QKV: usize = 3 * WIDTH;
@@ -440,7 +440,12 @@ unsafe fn row_max_avx2(row: &[f32]) -> f32 {
     lanes.iter().chain(chunks.remainder()).fold(f32::NEG_INFINITY, |m, &v| m.max(v))
 }
 
-/// `row[j] = exp(row[j] - max)`, returning the sum.
+/// Probabilities below `exp(FLUSH)` of the row's best are set to zero: they change nothing at float32 precision
+/// (the best key alone weighs 1), and multiplied by a value they would make denormal numbers, which x86 cores
+/// handle 10-50x slower (`examples/attention.rs --sharp`).
+const FLUSH: f32 = -40.0;
+
+/// `row[j] = exp(row[j] - max)` (zero below `FLUSH`), returning the sum.
 fn exp_shifted(row: &mut [f32], max: f32) -> f32 {
     #[cfg(target_arch = "x86_64")]
     if crate::simd::avx2() {
@@ -448,7 +453,7 @@ fn exp_shifted(row: &mut [f32], max: f32) -> f32 {
     }
     let mut sum = 0.0;
     for v in row.iter_mut() {
-        *v = (*v - max).exp();
+        *v = if *v - max < FLUSH { 0.0 } else { (*v - max).exp() };
         sum += *v;
     }
     sum
@@ -458,11 +463,12 @@ fn exp_shifted(row: &mut [f32], max: f32) -> f32 {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn exp_shifted_avx2(row: &mut [f32], max: f32) -> f32 {
     use std::arch::x86_64::*;
-    let m = _mm256_set1_ps(max);
+    let (m, flush) = (_mm256_set1_ps(max), _mm256_set1_ps(FLUSH));
     let mut total = _mm256_setzero_ps();
     let mut chunks = row.chunks_exact_mut(8);
     for c in &mut chunks {
-        let e = math::exp8(_mm256_sub_ps(_mm256_loadu_ps(c.as_ptr()), m));
+        let x = _mm256_sub_ps(_mm256_loadu_ps(c.as_ptr()), m);
+        let e = _mm256_and_ps(math::exp8(x), _mm256_cmp_ps::<_CMP_GE_OQ>(x, flush));
         _mm256_storeu_ps(c.as_mut_ptr(), e);
         total = _mm256_add_ps(total, e);
     }
@@ -470,7 +476,7 @@ unsafe fn exp_shifted_avx2(row: &mut [f32], max: f32) -> f32 {
     _mm256_storeu_ps(lanes.as_mut_ptr(), total);
     let mut sum: f32 = lanes.iter().sum();
     for v in chunks.into_remainder() {
-        *v = (*v - max).exp();
+        *v = if *v - max < FLUSH { 0.0 } else { (*v - max).exp() };
         sum += *v;
     }
     sum

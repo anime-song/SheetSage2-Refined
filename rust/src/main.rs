@@ -90,9 +90,7 @@ fn main() -> Result<()> {
     if inputs.is_empty() {
         usage();
     }
-    if let Some(n) = threads {
-        rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?;
-    }
+    sheetsage2_cpu::simd::init_threads(threads)?;
     let started = Instant::now();
     let heads: Vec<&str> = heads.split(',').filter(|h| !h.is_empty()).collect();
     let model = Model::load(&weights, &heads)?;

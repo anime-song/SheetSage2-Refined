@@ -121,6 +121,21 @@ pub fn linear_block(
                 let cols = NR.min(lin.n - n0);
                 for rp in 0..row_panels {
                     let rows = MR.min(m - rp * MR);
+                    if rows == MR && cols == NR && lin.scale.is_none() {
+                        // a whole tile: the kernel adds straight into `out`, the bias and GELU follow on the last slice
+                        let c = &mut out[rp * MR * ldo + n0..];
+                        kernel_into(kc, &apack[rp * MR * kc..], 1, MR, b, ldb, c, ldo, !(first && !accumulate));
+                        if last {
+                            for r in 0..MR {
+                                let o = &mut c[r * ldo..r * ldo + NR];
+                                o.iter_mut().zip(&lin.bias[n0..n0 + NR]).for_each(|(o, b)| *o += b);
+                                if act == Act::Gelu {
+                                    math::gelu_slice(o);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     kernel(kc, &apack[rp * MR * kc..], 1, MR, b, ldb, &mut tile);
                     let scale = lin.scale.map(|s| &s[n0..n0 + cols]);
                     for r in 0..rows {

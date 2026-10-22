@@ -19,3 +19,24 @@ pub fn avx2() -> bool {
         }
     })
 }
+
+/// Flush denormal results to zero and read denormal inputs as zero (MXCSR FTZ | DAZ) on the calling thread: the
+/// model never needs numbers below 1e-38, and x86 cores slow down 10-50x on them.
+pub fn flush_denormals() {
+    #[cfg(target_arch = "x86_64")]
+    #[allow(deprecated)]
+    unsafe {
+        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        _mm_setcsr(_mm_getcsr() | 0x8040);
+    }
+}
+
+/// The global thread pool (`threads`, default: one per logical CPU), every thread flushing denormals.
+pub fn init_threads(threads: Option<usize>) -> Result<(), rayon::ThreadPoolBuildError> {
+    flush_denormals();
+    let mut builder = rayon::ThreadPoolBuilder::new().start_handler(|_| flush_denormals());
+    if let Some(n) = threads {
+        builder = builder.num_threads(n);
+    }
+    builder.build_global()
+}

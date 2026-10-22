@@ -17,7 +17,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let threads = args.iter().position(|a| a == "--threads").and_then(|i| args.get(i + 1)?.parse().ok());
     let threads: usize = threads.unwrap_or(std::thread::available_parallelism().map_or(1, |n| n.get()));
-    rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().unwrap();
+    sheetsage2_cpu::simd::init_threads(Some(threads)).unwrap();
     let (a, b) = (vec![1.0f32; MR * 256], vec![0.5f32; 256 * NR]);
     let reps = 200_000;
     for t in [1, threads] {
@@ -48,11 +48,14 @@ fn main() {
     let mut out = vec![0.0f32; m * 4096];
     let mut run = |lin: &Linear| {
         gemm::linear(&x, lin.k, m, lin, &mut out, lin.n, Act::None, false, None);
-        let start = Instant::now();
-        for _ in 0..3 {
-            gemm::linear(&x, lin.k, m, lin, &mut out, lin.n, Act::None, false, None);
+        // the best of several runs: the cloud machines this was tuned on are noisy
+        let mut best = f64::INFINITY;
+        for _ in 0..7 {
+            let start = Instant::now();
+            gemm::linear(&x, lin.k, m, lin, &mut out, lin.n, Act::Gelu, false, None);
+            best = best.min(start.elapsed().as_secs_f64());
         }
-        3.0 * 2.0 * (m * lin.n * lin.k) as f64 / start.elapsed().as_secs_f64() / 1e9
+        2.0 * (m * lin.n * lin.k) as f64 / best / 1e9
     };
     if args.iter().any(|a| a == "--tune") {
         let mut best = (0.0, 0, 0);
