@@ -124,6 +124,12 @@ fn main() -> Result<()> {
     #[cfg(feature = "gpu")]
     if let Some(gpu) = &mut model.gpu {
         gpu.set_cpu_heads(cpu_heads)?;
+    } else if cpu_heads > 0 {
+        return Err("--cpu-heads needs --device gpu".into());
+    }
+    #[cfg(not(feature = "gpu"))]
+    if cpu_heads > 0 {
+        return Err("--cpu-heads needs --device gpu".into());
     }
     #[cfg(feature = "gpu")]
     if let Some(gpu) = &model.gpu {
