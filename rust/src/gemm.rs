@@ -136,7 +136,7 @@ fn product(
         let (apack, bpanel) = &mut *s.borrow_mut();
         let row_panels = m.div_ceil(MR);
         let block_k = kc();
-        apack.resize(row_panels * MR * block_k, 0.0);
+        apack.resize(row_panels * MR * block_k + 2, 0.0); // + 2: pack_a's last 8-wide store
         bpanel.resize(block_k * NR, 0.0);
         let k = lin.k;
         let mut tile = [0f32; MR * NR];
@@ -195,6 +195,84 @@ fn epilogue(o: &mut [f32], t: &[f32], bias: &[f32], overwrite: bool, last: bool,
 }
 
 fn pack_a(a: &[f32], lda: usize, m: usize, k0: usize, kc: usize, a_scale: Option<&[f32]>, apack: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if simd::avx2() {
+        let full = m / MR;
+        assert!(apack.len() >= full * MR * kc + 2);
+        unsafe { pack_a_avx2(a, lda, full, k0, kc, a_scale, apack) };
+        if full * MR < m {
+            pack_a_scalar(&a[full * MR * lda..], lda, m - full * MR, k0, kc, a_scale, &mut apack[full * MR * kc..]);
+        }
+        return;
+    }
+    pack_a_scalar(a, lda, m, k0, kc, a_scale, apack);
+}
+
+/// `pack_a` for `panels` whole 6-row panels, 8 columns at a time: the 6 x 8 block (two zero rows added) is
+/// transposed and each column's 6 values stored with an 8-wide store, the next store overwriting the two extra.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn pack_a_avx2(
+    a: &[f32],
+    lda: usize,
+    panels: usize,
+    k0: usize,
+    kc: usize,
+    a_scale: Option<&[f32]>,
+    apack: &mut [f32],
+) {
+    assert!(panels == 0 || a.len() >= (panels * MR - 1) * lda + k0 + kc);
+    let full = kc / 8 * 8;
+    for rp in 0..panels {
+        let dst = apack.as_mut_ptr().add(rp * MR * kc);
+        let src = a.as_ptr().add(rp * MR * lda + k0);
+        for p in (0..full).step_by(8) {
+            let g = match a_scale {
+                Some(s) => _mm256_loadu_ps(s.as_ptr().add(k0 + p)),
+                None => _mm256_set1_ps(1.0),
+            };
+            let row = |r: usize| _mm256_mul_ps(_mm256_loadu_ps(src.add(r * lda + p)), g);
+            let (r0, r1, r2, r3, r4, r5) = (row(0), row(1), row(2), row(3), row(4), row(5));
+            let z = _mm256_setzero_ps();
+            // 8 x 8 transpose of rows r0 .. r5, 0, 0
+            let t0 = _mm256_unpacklo_ps(r0, r1);
+            let t1 = _mm256_unpackhi_ps(r0, r1);
+            let t2 = _mm256_unpacklo_ps(r2, r3);
+            let t3 = _mm256_unpackhi_ps(r2, r3);
+            let t4 = _mm256_unpacklo_ps(r4, r5);
+            let t5 = _mm256_unpackhi_ps(r4, r5);
+            let u0 = _mm256_shuffle_ps::<0x44>(t0, t2);
+            let u1 = _mm256_shuffle_ps::<0xEE>(t0, t2);
+            let u2 = _mm256_shuffle_ps::<0x44>(t1, t3);
+            let u3 = _mm256_shuffle_ps::<0xEE>(t1, t3);
+            let u4 = _mm256_shuffle_ps::<0x44>(t4, z);
+            let u5 = _mm256_shuffle_ps::<0xEE>(t4, z);
+            let u6 = _mm256_shuffle_ps::<0x44>(t5, z);
+            let u7 = _mm256_shuffle_ps::<0xEE>(t5, z);
+            let cols = [
+                _mm256_permute2f128_ps::<0x20>(u0, u4),
+                _mm256_permute2f128_ps::<0x20>(u1, u5),
+                _mm256_permute2f128_ps::<0x20>(u2, u6),
+                _mm256_permute2f128_ps::<0x20>(u3, u7),
+                _mm256_permute2f128_ps::<0x31>(u0, u4),
+                _mm256_permute2f128_ps::<0x31>(u1, u5),
+                _mm256_permute2f128_ps::<0x31>(u2, u6),
+                _mm256_permute2f128_ps::<0x31>(u3, u7),
+            ];
+            for (j, c) in cols.into_iter().enumerate() {
+                _mm256_storeu_ps(dst.add((p + j) * MR), c);
+            }
+        }
+        for p in full..kc {
+            let g = a_scale.map_or(1.0, |s| s[k0 + p]);
+            for r in 0..MR {
+                *dst.add(p * MR + r) = *src.add(r * lda + p) * g;
+            }
+        }
+    }
+}
+
+fn pack_a_scalar(a: &[f32], lda: usize, m: usize, k0: usize, kc: usize, a_scale: Option<&[f32]>, apack: &mut [f32]) {
     for rp in 0..m.div_ceil(MR) {
         let dst = &mut apack[rp * MR * kc..(rp + 1) * MR * kc];
         for r in 0..MR {
@@ -389,6 +467,24 @@ mod tests {
 
     fn leak<T>(v: Vec<T>) -> &'static [T] {
         Box::leak(v.into_boxed_slice())
+    }
+
+    #[test]
+    fn packing_matches_scalar() {
+        // two whole panels and a partial one; a slice of k with a tail past the 8-wide steps
+        let (m, lda, k0, kc): (usize, usize, usize, usize) = (15, 40, 3, 21);
+        let a: Vec<f32> = (0..m * lda).map(|i| i as f32 * 0.25 - 7.0).collect();
+        let gains: Vec<f32> = (0..lda).map(|i| 1.0 + i as f32 / 16.0).collect();
+        for scale in [None, Some(&gains[..])] {
+            let len = m.div_ceil(MR) * MR * kc;
+            let (mut got, mut want) = (vec![f32::NAN; len + 2], vec![f32::NAN; len]);
+            pack_a(&a, lda, m, k0, kc, scale, &mut got);
+            pack_a_scalar(&a, lda, m, k0, kc, scale, &mut want);
+            assert_eq!(
+                got[..len].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
     }
 
     fn pack(w: &[f32], n: usize, k: usize) -> Vec<f32> {
