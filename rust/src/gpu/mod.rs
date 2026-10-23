@@ -9,7 +9,8 @@ use std::borrow::Cow;
 use wgpu::util::DeviceExt;
 
 use crate::Result;
-use crate::encoder::{Encoder, HEAD_DIM, HEADS, Mix, N_MELS, STATES, WIDTH};
+use crate::encoder::{Encoder, HEAD_DIM, HEADS, Mix, N_MELS, STATES, WIDTH, attend_heads};
+use crate::gemm::{MR, NR};
 use crate::lora::Adapter;
 use crate::weights::{Linear, PANEL, Panels, Weights};
 
@@ -43,6 +44,8 @@ struct Kernels {
     col_squares: wgpu::ComputePipeline,
     grn_gain: wgpu::ComputePipeline,
     attention: wgpu::ComputePipeline,
+    pack: wgpu::ComputePipeline,
+    merge: wgpu::ComputePipeline,
 }
 
 struct GLinear {
@@ -108,6 +111,18 @@ pub struct GpuEncoder {
     grn: wgpu::Buffer,
     mixes: Vec<wgpu::Buffer>,
     low: wgpu::Buffer, // an adapter's x A^T, [rows][R]
+    split: Option<Split>,
+}
+
+/// The last `heads` attention heads computed on the CPU while the GPU computes the others (`set_cpu_heads`):
+/// `packed` gets their q, k, v in the CPU engine's layouts (`split.wgsl`), `staging` a copy the CPU reads, `host`
+/// the q rows the CPU turns into the output, `out` that output on the GPU.
+struct Split {
+    heads: u32,
+    packed: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    out: wgpu::Buffer,
+    host: std::sync::Mutex<Vec<f32>>,
 }
 
 fn f16_bits(v: f32) -> u16 {
@@ -151,6 +166,7 @@ impl GpuEncoder {
         let rows = module("rows", include_str!("rows.wgsl"), true);
         let misc = module("misc", include_str!("misc.wgsl"), false);
         let attention = module("attention", include_str!("attention.wgsl"), false);
+        let split = module("split", include_str!("split.wgsl"), false);
         let pipeline = |m: &wgpu::ShaderModule, entry: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
@@ -171,6 +187,8 @@ impl GpuEncoder {
             col_squares: pipeline(&misc, "col_squares"),
             grn_gain: pipeline(&misc, "grn_gain"),
             attention: pipeline(&attention, "main"),
+            pack: pipeline(&split, "pack"),
+            merge: pipeline(&split, "merge"),
         };
         let cpu = Encoder::load(weights)?;
         let vector = |name: &str| -> Result<wgpu::Buffer> {
@@ -265,6 +283,7 @@ impl GpuEncoder {
             mixes: (0..mixes).map(|i| storage(&format!("mix{i}"), frames * WIDTH)).collect(),
             dummy: storage("dummy", 4),
             low: storage("low", 1),
+            split: None,
             device,
             queue,
             k,
@@ -379,6 +398,44 @@ impl GpuEncoder {
         Ok(())
     }
 
+    /// Compute the last `heads` of the 16 attention heads on the CPU, at the same time as the GPU computes the others
+    /// (0: all on the GPU).  Their q, k, v are copied to the CPU and the outputs back once per block, which takes
+    /// buffers of about `heads` x 12 MB (for a 300 s window).  The results are the same.
+    pub fn set_cpu_heads(&mut self, heads: usize) -> Result<()> {
+        if heads > HEADS {
+            return Err(format!("{heads} CPU heads, more than the {HEADS} there are").into());
+        }
+        if let Some(s) = self.split.take() {
+            self.memory.1 -=
+                s.packed.size() + s.staging.size() + s.out.size() + 4 * s.host.lock().unwrap().len() as u64;
+        }
+        if heads == 0 {
+            return Ok(());
+        }
+        let (frames, width) = (self.max_frames as usize, heads * HEAD_DIM);
+        let q = (frames + MR) * width;
+        let packed = q + 2 * width * frames.div_ceil(NR) * NR;
+        let buffer = |name: &str, floats: usize, usage: wgpu::BufferUsages| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(name),
+                size: (floats * 4) as u64,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        use wgpu::BufferUsages as U;
+        let s = Split {
+            heads: heads as u32,
+            packed: buffer("packed heads", packed, U::STORAGE | U::COPY_SRC),
+            staging: buffer("packed heads (CPU)", packed, U::MAP_READ | U::COPY_DST),
+            out: buffer("CPU heads", frames * width, U::STORAGE | U::COPY_DST),
+            host: std::sync::Mutex::new(vec![0.0; q]),
+        };
+        self.memory.1 += s.packed.size() + s.staging.size() + s.out.size() + 4 * q as u64;
+        self.split = Some(s);
+        Ok(())
+    }
+
     pub fn max_frames(&self) -> usize {
         self.max_frames as usize
     }
@@ -476,7 +533,7 @@ impl GpuEncoder {
         self.submit(enc);
         for (i, b) in self.blocks.iter().enumerate() {
             let mut enc = self.encoder();
-            x = self.block(&mut enc, b, x, frames);
+            x = self.block(&mut enc, b, x, frames)?;
             for (m, buf) in mixes.iter().zip(&self.mixes) {
                 self.axpy(&mut enc, &self.rows[x], buf, n, m.weights[i + 1], false);
             }
@@ -500,7 +557,7 @@ impl GpuEncoder {
     }
 
     /// One Conformer block on `rows[x]`; returns the index of the buffer holding its output.
-    fn block(&self, enc: &mut wgpu::CommandEncoder, b: &GBlock, x: usize, frames: u32) -> usize {
+    fn block(&self, enc: &mut wgpu::CommandEncoder, b: &GBlock, x: usize, frames: u32) -> Result<usize> {
         let (a, c) = ((x + 1) % 3, (x + 2) % 3);
         let w = WIDTH as u32;
         let mut since = std::time::Instant::now();
@@ -522,14 +579,9 @@ impl GpuEncoder {
             0.0,
             groups(frames * 1024),
         );
-        {
-            let params = self.params(&[frames, 0, 0, 0]);
-            self.dispatch(
-                enc,
-                &self.k.attention,
-                &[(0, &params), (1, &self.wide), (2, &self.rows[a])],
-                (frames.div_ceil(ATTENTION_QUERIES), HEADS as u32),
-            );
+        match &self.split {
+            Some(s) => self.split_attention(enc, s, a, frames)?,
+            None => self.attention(enc, a, frames, HEADS as u32),
         }
         self.checkpoint(enc, "gpu: attention core", &mut since);
         self.gemm(enc, &self.rows[a], w, frames, &b.out, &self.rows[x], w, 0, false, true, None);
@@ -555,7 +607,70 @@ impl GpuEncoder {
         self.checkpoint(enc, "gpu: ffn", &mut since);
         // the final norm writes the next buffer, which then holds the activations
         self.layer_norm(enc, &self.rows[x], &self.rows[a], w, frames, Some(&b.final_norm), false, 1e-5);
-        a
+        Ok(a)
+    }
+
+    /// The attention core of heads 0 .. `heads` on q k v in `wide` (rotary positions applied) into `rows[out]`.
+    fn attention(&self, enc: &mut wgpu::CommandEncoder, out: usize, frames: u32, heads: u32) {
+        let params = self.params(&[frames, 0, 0, 0]);
+        self.dispatch(
+            enc,
+            &self.k.attention,
+            &[(0, &params), (1, &self.wide), (2, &self.rows[out])],
+            (frames.div_ceil(ATTENTION_QUERIES), heads),
+        );
+    }
+
+    /// The attention core with the last `s.heads` heads on the CPU: their q k v go to the CPU (submitted with what
+    /// `enc` holds), the GPU's heads are submitted next and run while the CPU computes, and the CPU's output is
+    /// merged into `rows[out]` by a pass left in `enc`.
+    fn split_attention(&self, enc: &mut wgpu::CommandEncoder, s: &Split, out: usize, frames: u32) -> Result<()> {
+        let (heads, n) = (s.heads, frames as usize);
+        let first = HEADS as u32 - heads;
+        let width = heads as usize * HEAD_DIM;
+        let padded = n.div_ceil(NR) * NR;
+        let (q_len, kv_len) = ((n + MR) * width, width * padded);
+        let total = q_len + 2 * kv_len;
+        let params = self.params(&[frames, first, heads, padded as u32, MR as u32, NR as u32]);
+        self.dispatch(enc, &self.k.pack, &[(0, &params), (1, &self.wide), (2, &s.packed)], groups(total as u32));
+        enc.copy_buffer_to_buffer(&s.packed, 0, &s.staging, 0, (total * 4) as u64);
+        let copied = self.queue.submit([std::mem::replace(enc, self.encoder()).finish()]);
+        if first > 0 {
+            self.attention(enc, out, frames, first);
+            self.submit(std::mem::replace(enc, self.encoder()));
+        }
+        let slice = s.staging.slice(..(total * 4) as u64);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        self.device.poll(wgpu::PollType::Wait { submission_index: Some(copied), timeout: None })?;
+        let mut host = s.host.lock().unwrap();
+        {
+            let data = slice.get_mapped_range().map_err(|e| format!("reading back: {e:?}"))?;
+            assert_eq!(data.as_ptr() as usize % 4, 0);
+            // SAFETY: the mapping is `total` floats, aligned (checked above), and read only while mapped
+            let f = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, total) };
+            host[..q_len].copy_from_slice(&f[..q_len]);
+            crate::profile::time("cpu: attention heads", || {
+                attend_heads(
+                    &mut host[..q_len],
+                    width,
+                    heads as usize,
+                    &f[q_len..][..kv_len],
+                    &f[q_len + kv_len..],
+                    padded,
+                    n,
+                )
+            });
+        }
+        s.staging.unmap();
+        self.queue.write_buffer(&s.out, 0, bytes(&host[..n * width]));
+        let params = self.params(&[frames, first, heads, padded as u32, MR as u32, NR as u32]);
+        self.dispatch(
+            enc,
+            &self.k.merge,
+            &[(0, &params), (1, &s.out), (2, &self.rows[out])],
+            groups((n * width) as u32),
+        );
+        Ok(())
     }
 
     /// `rows[x] += fc2(gelu(fc1(norm(rows[x]))))`, normalising into `rows[norm]`.

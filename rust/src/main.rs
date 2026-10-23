@@ -1,10 +1,12 @@
 //! sheetsage2-cpu --weights cpu.safetensors [--adapter LORA] [--threads N] [--out-dir DIR] [--heads beat,melody] [--device cpu|gpu] [--logits]
-//!                [--tempo-weight W] [--hold P] AUDIO...
+//!                [--cpu-heads N] [--tempo-weight W] [--hold P] AUDIO...
 //!
 //! Writes `<out-dir>/<stem>.beats.json` and `<stem>.melody.json` as `python -m sheetsage2_refined.beats` / `.melody`
 //! do, and with `--logits` also `<stem>.heads.safetensors` with each head's logits (`<head>.<output>`,
 //! `[frames, width]`).  AUDIO may be a WAV / FLAC / MP3 / Ogg file, or a `.f32` file of raw little-endian float32
 //! samples, mono at 24 kHz.  `--adapter` applies a LoRA adapter (`export_cpu --adapter`) to the encoder at run time.
+//! `--cpu-heads N` (with `--device gpu`) computes the last N of the 16 attention heads on the CPU while the GPU
+//! computes the others.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -15,7 +17,7 @@ use sheetsage2_cpu::{MemoryWatch, Model, Outputs, Result, audio, encoder::SAMPLE
 fn usage() -> ! {
     eprintln!(
         "usage: sheetsage2-cpu --weights FILE [--adapter LORA] [--threads N] [--out-dir DIR] [--heads beat,melody] [--device cpu|gpu] [--logits] \
-         [--tempo-weight W] [--hold P] AUDIO..."
+         [--cpu-heads N] [--tempo-weight W] [--hold P] AUDIO..."
     );
     std::process::exit(2)
 }
@@ -76,6 +78,7 @@ fn main() -> Result<()> {
     let mut from_logits = false;
     let mut device = "cpu".to_string(); // inputs are `--logits` files: run the trackers only (for testing them)
     let mut adapter = None;
+    let mut cpu_heads = 0usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--weights" => weights = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
@@ -86,6 +89,7 @@ fn main() -> Result<()> {
             "--logits" => logits = true,
             "--device" => device = args.next().unwrap_or_else(|| usage()),
             "--from-logits" => from_logits = true,
+            "--cpu-heads" => cpu_heads = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--hold" => hold = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--tempo-weight" => tempo_weight = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "-h" | "--help" => usage(),
@@ -116,6 +120,10 @@ fn main() -> Result<()> {
             adapter.layers.len(),
             adapter.bytes() as f64 / (1 << 20) as f64
         );
+    }
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = &mut model.gpu {
+        gpu.set_cpu_heads(cpu_heads)?;
     }
     #[cfg(feature = "gpu")]
     if let Some(gpu) = &model.gpu {

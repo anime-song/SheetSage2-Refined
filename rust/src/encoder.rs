@@ -387,12 +387,26 @@ fn feed_forward(x: &mut [f32], frames: usize, (fc1, fc2): &(Linear, Linear)) {
 /// `qo` holds q `[frames + MR, WIDTH]` (the last MR rows padding) and gets the output in its place: each task reads
 /// only its own rows of its own head and writes them when it is done with them.
 pub fn attend(qo: &mut [f32], keys: &[f32], values: &[f32], padded: usize, frames: usize) {
+    attend_heads(qo, WIDTH, HEADS, keys, values, padded, frames);
+}
+
+/// `attend` on `heads` heads whose q rows (and outputs) are `ldq` floats apart, head h in columns h * HEAD_DIM ..
+/// (h + 1) * HEAD_DIM; `keys` and `values` hold those heads only.
+pub fn attend_heads(
+    qo: &mut [f32],
+    ldq: usize,
+    heads: usize,
+    keys: &[f32],
+    values: &[f32],
+    padded: usize,
+    frames: usize,
+) {
     const QB: usize = 16 * MR;
     const KB: usize = 256;
-    assert!(qo.len() >= (frames + MR) * WIDTH);
+    assert!(qo.len() >= (frames + MR) * ldq);
     let blocks = frames.div_ceil(QB);
     let out_ptr = SendPtr(qo.as_mut_ptr());
-    (0..HEADS * blocks).into_par_iter().for_each(|task| {
+    (0..heads * blocks).into_par_iter().for_each(|task| {
         let (head, qb) = (task / blocks, task % blocks);
         let q0 = qb * QB;
         let rows = QB.min(frames - q0);
@@ -403,17 +417,17 @@ pub fn attend(qo: &mut [f32], keys: &[f32], values: &[f32], padded: usize, frame
         let mut acc = vec![0.0f32; QB * HEAD_DIM];
         let mut max = vec![f32::NEG_INFINITY; QB];
         let mut sum = vec![0.0f32; QB];
-        let q_len = (row_panels * MR - 1) * WIDTH + HEAD_DIM;
+        let q_len = (row_panels * MR - 1) * ldq + HEAD_DIM;
         for k0 in (0..frames).step_by(KB) {
             let kb = KB.min(frames - k0);
             // The task's q rows, read only while no output is written.
-            let q = unsafe { std::slice::from_raw_parts(out_ptr.get().add(q0 * WIDTH + head * HEAD_DIM), q_len) };
+            let q = unsafe { std::slice::from_raw_parts(out_ptr.get().add(q0 * ldq + head * HEAD_DIM), q_len) };
             // scores[r, j] = q_r . k_(k0 + j)
             for rp in 0..row_panels {
                 for cp in 0..kb.div_ceil(NR) {
                     let panel = &keys[(k0 / NR + cp) * HEAD_DIM * NR..][..HEAD_DIM * NR];
                     let c = &mut scores[rp * MR * KB + cp * NR..];
-                    gemm::kernel_into(HEAD_DIM, &q[rp * MR * WIDTH..], WIDTH, 1, panel, NR, c, KB, false);
+                    gemm::kernel_into(HEAD_DIM, &q[rp * MR * ldq..], ldq, 1, panel, NR, c, KB, false);
                 }
             }
             for r in 0..rows {
@@ -453,7 +467,7 @@ pub fn attend(qo: &mut [f32], keys: &[f32], values: &[f32], padded: usize, frame
             let inv = 1.0 / sum[r];
             // Each task writes its own rows of its own head's columns.
             let o = unsafe {
-                std::slice::from_raw_parts_mut(out_ptr.get().add((q0 + r) * WIDTH + head * HEAD_DIM), HEAD_DIM)
+                std::slice::from_raw_parts_mut(out_ptr.get().add((q0 + r) * ldq + head * HEAD_DIM), HEAD_DIM)
             };
             for (o, a) in o.iter_mut().zip(&acc[r * HEAD_DIM..(r + 1) * HEAD_DIM]) {
                 *o = a * inv;

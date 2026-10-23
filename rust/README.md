@@ -62,6 +62,13 @@ built without the iteration limit wgpu puts on every loop, which kept the compil
 window; the CPU's mapping of the weights is dropped after the upload. The work is submitted a block at a time, so no
 submission runs long enough for the driver to reset the GPU.
 
+`--cpu-heads N` splits the attention core: the last N of the 16 heads run on the CPU (the CPU engine's kernel) while
+the GPU computes the others. Per block their q, k and v are packed into the CPU's layouts on the GPU and copied back,
+and the CPU's output is copied up and merged; the results are the same, and the buffers take about 15 MB per CPU head
+for a 300 s window. It loads the CPU and the GPU at the same time, so it is worth it only where both can run at full
+speed together; the best N is where the two finish together (`SHEETSAGE_PROFILE=1` shows the CPU's part as
+`cpu: attention heads`).
+
 Checked on Mesa's software Vulkan (llvmpipe): the logits of a 60 s synthetic song are within 5e-4 of the CPU
 engine's (beats, bars and notes identical) and `gpu_bench`'s linear layers and attention on a whole 300 s window
 within 2e-5. Its speed has to be measured on the GPU it runs on:
