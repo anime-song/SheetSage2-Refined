@@ -15,6 +15,9 @@ use crate::weights::{Linear, PANEL, Panels, Weights};
 
 const COMMON: &str = include_str!("common.wgsl");
 
+/// Queries per workgroup of attention.wgsl.
+const ATTENTION_QUERIES: u32 = 256;
+
 struct Kernels {
     gemm: wgpu::ComputePipeline,
     layer_norm: wgpu::ComputePipeline,
@@ -513,7 +516,7 @@ impl GpuEncoder {
                 enc,
                 &self.k.attention,
                 &[(0, &params), (1, &self.wide), (2, &self.rows[a])],
-                (frames.div_ceil(32), HEADS as u32),
+                (frames.div_ceil(ATTENTION_QUERIES), HEADS as u32),
             );
         }
         self.checkpoint(enc, "gpu: attention core", &mut since);
@@ -584,8 +587,33 @@ impl GpuEncoder {
     }
 
     /// The attention core on q k v rows `[frames][3072]` (rotary positions already applied): the output
-    /// `[frames][1024]` and the best of `reps` GPU times.
-    pub fn bench_attention(&self, qkv: &[f32], frames: u32, reps: usize) -> Result<(Vec<f32>, f64)> {
+    /// `[frames][1024]` and the best of `reps` GPU times.  `kernel` replaces the engine's with WGSL source of the
+    /// same interface that takes `queries` per workgroup (to compare kernels).
+    pub fn bench_attention(
+        &self,
+        qkv: &[f32],
+        frames: u32,
+        reps: usize,
+        kernel: Option<(&str, u32)>,
+    ) -> Result<(Vec<f32>, f64)> {
+        let other = kernel.map(|(src, _)| {
+            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("attention (bench)"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(src)),
+            });
+            self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("attention (bench)"),
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
+        let (pipeline, queries) = match (&other, kernel) {
+            (Some(p), Some((_, q))) => (p, q),
+            _ => (&self.k.attention, ATTENTION_QUERIES),
+        };
         self.queue.write_buffer(&self.wide, 0, bytes(qkv));
         let mut best = f64::INFINITY;
         for _ in 0..reps {
@@ -595,9 +623,9 @@ impl GpuEncoder {
             let params = self.params(&[frames, 0, 0, 0]);
             self.dispatch(
                 &mut enc,
-                &self.k.attention,
+                pipeline,
                 &[(0, &params), (1, &self.wide), (2, &self.rows[0])],
-                (frames.div_ceil(32), HEADS as u32),
+                (frames.div_ceil(queries), HEADS as u32),
             );
             self.submit(enc);
             self.wait();

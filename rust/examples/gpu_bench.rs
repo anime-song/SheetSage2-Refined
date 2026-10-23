@@ -42,7 +42,9 @@ fn main() -> sheetsage2_cpu::Result<()> {
     // attention: q k v with the scale of real ones, then the CPU's layouts
     let qkv: Vec<f32> =
         (0..frames * 3 * WIDTH).map(|i| rand() * if i % (3 * WIDTH) < WIDTH { 8.0 } else { 2.0 }).collect();
-    let (out, secs) = gpu.bench_attention(&qkv, frames as u32, 2)?;
+    let (out, secs) = gpu.bench_attention(&qkv, frames as u32, 2, None)?;
+    let (tiled, tiled_secs) =
+        gpu.bench_attention(&qkv, frames as u32, 2, Some((include_str!("attention_tiled.wgsl"), 32)))?;
     let padded = frames.div_ceil(NR) * NR;
     let mut q = vec![0.0f32; (frames + MR) * WIDTH];
     let mut keys = vec![0.0f32; HEADS * HEAD_DIM * padded];
@@ -64,6 +66,11 @@ fn main() -> sheetsage2_cpu::Result<()> {
     println!(
         "attention {frames} frames: {:.1} GFLOP/s, {secs:.3} s per layer, max |gpu - cpu| {d:.2e} (values up to {range:.1})",
         flops / secs / 1e9
+    );
+    let (d, _) = max_diff(&tiled, &q[..frames * WIDTH]);
+    println!(
+        "attention (previous kernel, examples/attention_tiled.wgsl): {:.1} GFLOP/s, {tiled_secs:.3} s per layer, max |gpu - cpu| {d:.2e}",
+        flops / tiled_secs / 1e9
     );
     Ok(())
 }
