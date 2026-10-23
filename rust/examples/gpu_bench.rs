@@ -45,6 +45,11 @@ fn main() -> sheetsage2_cpu::Result<()> {
     let (out, secs) = gpu.bench_attention(&qkv, frames as u32, 2, None)?;
     let others = [
         (
+            "examples/attention_pair.wgsl: two threads per query, half the registers",
+            include_str!("attention_pair.wgsl"),
+            128,
+        ),
+        (
             "examples/attention_scalar.wgsl: keys and values read directly, no workgroup memory",
             include_str!("attention_scalar.wgsl"),
             256,
