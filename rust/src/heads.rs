@@ -6,7 +6,7 @@ use rayon::prelude::*;
 
 use crate::Result;
 use crate::encoder::WIDTH;
-use crate::gemm::{self, Act};
+use crate::gemm::{self, Act, MR, NR};
 use crate::math;
 use crate::weights::{Linear, Weights};
 
@@ -146,10 +146,7 @@ fn gru_pass(gru: &Gru, gates: &[f32], frames: usize, h: usize, reverse: bool) ->
     let mut rec = vec![0.0f32; 3 * h];
     for step in 0..frames {
         let t = if reverse { frames - 1 - step } else { step };
-        for (j, r) in rec.iter_mut().enumerate() {
-            let w = &gru.hh_w[j * h..(j + 1) * h];
-            *r = gru.hh_b[j] + w.iter().zip(&state).map(|(a, b)| a * b).sum::<f32>();
-        }
+        math::matvec(gru.hh_w, &state, gru.hh_b, &mut rec);
         let gi = &gates[t * 3 * h..(t + 1) * 3 * h];
         for i in 0..h {
             let r = math::sigmoid(gi[i] + rec[i]);
@@ -164,26 +161,55 @@ fn gru_pass(gru: &Gru, gates: &[f32], frames: usize, h: usize, reverse: bool) ->
 
 /// A grouped 1-D convolution, kernel 9, padding 4, groups of 32 channels, over `x` `[frames, c]`.
 fn grouped_conv(x: &[f32], frames: usize, c: usize, w: &[f32], b: &[f32]) -> Vec<f32> {
-    let mut y = vec![0.0f32; frames * c];
-    let half = (TAPS / 2) as isize;
-    y.par_chunks_mut(c).enumerate().for_each(|(t, o)| {
-        o.copy_from_slice(b);
+    // Per group and tap a [rows, 32] x [32, 32] product on the GEMM kernel, 6 frames x 16 channels at a time, over
+    // `x` with TAPS / 2 zero rows either side (and rows to a multiple of 6 after it).
+    let half = TAPS / 2;
+    let rows = frames.div_ceil(MR) * MR;
+    let mut padded = vec![0.0f32; (rows + TAPS) * c];
+    padded[half * c..(half + frames) * c].copy_from_slice(&x[..frames * c]);
+    let mut y = vec![0.0f32; rows * c];
+    y.par_chunks_mut(MR * c).enumerate().for_each(|(panel, out)| {
+        for o in out.chunks_exact_mut(c) {
+            o.copy_from_slice(b);
+        }
         for g in 0..c / GROUP {
-            let o = &mut o[g * GROUP..(g + 1) * GROUP];
             for j in 0..TAPS {
-                let src = t as isize + j as isize - half;
-                if src < 0 || src >= frames as isize {
-                    continue;
-                }
-                let row = &x[src as usize * c + g * GROUP..][..GROUP];
+                let a = &padded[(panel * MR + j) * c + g * GROUP..];
                 let wj = &w[(g * TAPS + j) * GROUP * GROUP..][..GROUP * GROUP];
-                for (i, &v) in row.iter().enumerate() {
-                    for (o, w) in o.iter_mut().zip(&wj[i * GROUP..(i + 1) * GROUP]) {
-                        *o += w * v;
-                    }
+                for col in (0..GROUP).step_by(NR) {
+                    gemm::kernel_into(GROUP, a, c, 1, &wj[col..], GROUP, &mut out[g * GROUP + col..], c, true);
                 }
             }
         }
     });
+    y.truncate(frames * c);
     y
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grouped_conv_matches_direct_sums() {
+        // 2 groups of 32 channels, 13 frames (not a multiple of 6, and shorter than twice the taps)
+        let (frames, c) = (13, 2 * GROUP);
+        let x: Vec<f32> = (0..frames * c).map(|i| ((i * 31) % 17) as f32 / 8.0 - 1.0).collect();
+        let w: Vec<f32> = (0..c / GROUP * TAPS * GROUP * GROUP).map(|i| ((i * 13) % 23) as f32 / 50.0 - 0.2).collect();
+        let b: Vec<f32> = (0..c).map(|o| o as f32 * 0.01).collect();
+        let y = grouped_conv(&x, frames, c, &w, &b);
+        for t in 0..frames {
+            for o in 0..c {
+                let (g, ol) = (o / GROUP, o % GROUP);
+                let mut want = b[o] as f64;
+                for j in 0..TAPS {
+                    let Some(src) = (t + j).checked_sub(TAPS / 2).filter(|&s| s < frames) else { continue };
+                    for i in 0..GROUP {
+                        want += x[src * c + g * GROUP + i] as f64 * w[((g * TAPS + j) * GROUP + i) * GROUP + ol] as f64;
+                    }
+                }
+                assert!((y[t * c + o] as f64 - want).abs() < 1e-4, "frame {t}, channel {o}");
+            }
+        }
+    }
 }

@@ -34,6 +34,53 @@ pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// `out[j] = bias[j] + w[j, :] . x` for row-major `w` `[out.len(), x.len()]` (a GRU's recurrent product).
+pub fn matvec(w: &[f32], x: &[f32], bias: &[f32], out: &mut [f32]) {
+    let n = x.len();
+    assert!(w.len() >= out.len() * n && bias.len() >= out.len());
+    #[cfg(target_arch = "x86_64")]
+    if simd::avx2() {
+        unsafe { matvec_avx2(w, x, bias, out) };
+        return;
+    }
+    for (j, o) in out.iter_mut().enumerate() {
+        *o = bias[j] + w[j * n..(j + 1) * n].iter().zip(x).map(|(a, b)| a * b).sum::<f32>();
+    }
+}
+
+/// Four rows at a time, each row's sum in its own 8 lanes (one load of `x` feeds four rows).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn matvec_avx2(w: &[f32], x: &[f32], bias: &[f32], out: &mut [f32]) {
+    let n = x.len();
+    let full = n / 8 * 8;
+    let hsum = |v: __m256| -> f32 {
+        let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        _mm_cvtss_f32(_mm_add_ss(s, _mm_shuffle_ps::<1>(s, s)))
+    };
+    let rows = out.len();
+    let mut j = 0;
+    while j < rows {
+        let group = (rows - j).min(4);
+        let mut acc = [_mm256_setzero_ps(); 4];
+        let mut i = 0;
+        while i < full {
+            let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+            for (r, a) in acc.iter_mut().enumerate().take(group) {
+                *a = _mm256_fmadd_ps(_mm256_loadu_ps(w.as_ptr().add((j + r) * n + i)), xv, *a);
+            }
+            i += 8;
+        }
+        for (r, a) in acc.iter().enumerate().take(group) {
+            let row = &w[(j + r) * n..(j + r + 1) * n];
+            let tail: f32 = row[full..].iter().zip(&x[full..]).map(|(a, b)| a * b).sum();
+            out[j + r] = bias[j + r] + hsum(*a) + tail;
+        }
+        j += group;
+    }
+}
+
 /// In-place GELU over a slice.
 pub fn gelu_slice(x: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
@@ -171,6 +218,21 @@ mod tests {
                     assert!((x.exp() - e).abs() <= 2e-7 * x.exp(), "exp({x})");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn matvec_matches_row_dots() {
+        // 7 rows (a group of four and a partial one), 21 columns (two vectors and a tail)
+        let (rows, n) = (7, 21);
+        let w: Vec<f32> = (0..rows * n).map(|i| ((i * 37) % 11) as f32 / 7.0 - 0.6).collect();
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.3).sin()).collect();
+        let bias: Vec<f32> = (0..rows).map(|j| j as f32 * 0.1).collect();
+        let mut out = vec![0.0f32; rows];
+        matvec(&w, &x, &bias, &mut out);
+        for j in 0..rows {
+            let want: f64 = bias[j] as f64 + (0..n).map(|i| w[j * n + i] as f64 * x[i] as f64).sum::<f64>();
+            assert!((out[j] as f64 - want).abs() < 1e-5, "row {j}: {} vs {want}", out[j]);
         }
     }
 }
