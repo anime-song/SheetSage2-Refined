@@ -43,8 +43,18 @@ fn main() -> sheetsage2_cpu::Result<()> {
     let qkv: Vec<f32> =
         (0..frames * 3 * WIDTH).map(|i| rand() * if i % (3 * WIDTH) < WIDTH { 8.0 } else { 2.0 }).collect();
     let (out, secs) = gpu.bench_attention(&qkv, frames as u32, 2, None)?;
-    let (tiled, tiled_secs) =
-        gpu.bench_attention(&qkv, frames as u32, 2, Some((include_str!("attention_tiled.wgsl"), 32)))?;
+    let others = [
+        (
+            "examples/attention_scalar.wgsl: keys and values read directly, no workgroup memory",
+            include_str!("attention_scalar.wgsl"),
+            256,
+        ),
+        ("examples/attention_tiled.wgsl: the previous kernel, 32 x 32 tiles", include_str!("attention_tiled.wgsl"), 32),
+    ];
+    let mut timed = Vec::new();
+    for (name, src, queries) in others {
+        timed.push((name, gpu.bench_attention(&qkv, frames as u32, 2, Some((src, queries)))?));
+    }
     let padded = frames.div_ceil(NR) * NR;
     let mut q = vec![0.0f32; (frames + MR) * WIDTH];
     let mut keys = vec![0.0f32; HEADS * HEAD_DIM * padded];
@@ -67,10 +77,12 @@ fn main() -> sheetsage2_cpu::Result<()> {
         "attention {frames} frames: {:.1} GFLOP/s, {secs:.3} s per layer, max |gpu - cpu| {d:.2e} (values up to {range:.1})",
         flops / secs / 1e9
     );
-    let (d, _) = max_diff(&tiled, &q[..frames * WIDTH]);
-    println!(
-        "attention (previous kernel, examples/attention_tiled.wgsl): {:.1} GFLOP/s, {tiled_secs:.3} s per layer, max |gpu - cpu| {d:.2e}",
-        flops / tiled_secs / 1e9
-    );
+    for (name, (other, other_secs)) in timed {
+        let (d, _) = max_diff(&other, &q[..frames * WIDTH]);
+        println!(
+            "  vs {name}: {:.1} GFLOP/s, {other_secs:.3} s per layer, max |gpu - cpu| {d:.2e}",
+            flops / other_secs / 1e9
+        );
+    }
     Ok(())
 }

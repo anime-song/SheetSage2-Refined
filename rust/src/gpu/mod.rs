@@ -15,6 +15,21 @@ use crate::weights::{Linear, PANEL, Panels, Weights};
 
 const COMMON: &str = include_str!("common.wgsl");
 
+/// A WGSL module without the iteration limit that wgpu adds to every loop: that limit is a branch per iteration
+/// which keeps the shader compiler from unrolling the kernels' fixed loops (on RADV it made the attention kernel
+/// one LDS read, a wait and four multiply-adds per step).  Every loop in these shaders has a bound.  Bounds checks
+/// stay on.
+fn shader(device: &wgpu::Device, name: &str, code: String) -> wgpu::ShaderModule {
+    let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() };
+    // SAFETY: the loops terminate (each has a fixed or a frame-count bound), which is what the limit guards.
+    unsafe {
+        device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(Cow::Owned(code)) },
+            checks,
+        )
+    }
+}
+
 /// Queries per workgroup of attention.wgsl.
 const ATTENTION_QUERIES: u32 = 256;
 
@@ -130,10 +145,7 @@ impl GpuEncoder {
         }))?;
         let module = |name: &str, src: &str, common: bool| {
             let code = if common { format!("{COMMON}\n{src}") } else { src.to_string() };
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(name),
-                source: wgpu::ShaderSource::Wgsl(Cow::Owned(code)),
-            })
+            shader(&device, name, code)
         };
         let gemm = module("gemm", include_str!("gemm.wgsl"), true);
         let rows = module("rows", include_str!("rows.wgsl"), true);
@@ -597,10 +609,7 @@ impl GpuEncoder {
         kernel: Option<(&str, u32)>,
     ) -> Result<(Vec<f32>, f64)> {
         let other = kernel.map(|(src, _)| {
-            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("attention (bench)"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(src)),
-            });
+            let module = shader(&self.device, "attention (bench)", src.to_string());
             self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("attention (bench)"),
                 layout: None,
