@@ -43,18 +43,24 @@ fn main() -> sheetsage2_cpu::Result<()> {
     let qkv: Vec<f32> =
         (0..frames * 3 * WIDTH).map(|i| rand() * if i % (3 * WIDTH) < WIDTH { 8.0 } else { 2.0 }).collect();
     let (out, secs) = gpu.bench_attention(&qkv, frames as u32, 2, None)?;
+    // The engine's kernel reading only keys 0 .. 63 (so from cache; the output is wrong and not compared): how
+    // much faster it gets shows how much reading keys and values from memory costs.
+    let cached =
+        include_str!("../src/gpu/attention.wgsl").replace("min(key, p.frames - 1u) * 768u", "(key % 64u) * 768u");
+    assert!(cached.contains("key % 64u"));
     let others = [
+        (
+            "examples/attention_lds.wgsl: keys and values shared through workgroup memory",
+            include_str!("attention_lds.wgsl"),
+            256,
+        ),
         (
             "examples/attention_pair.wgsl: two threads per query, half the registers",
             include_str!("attention_pair.wgsl"),
             128,
         ),
-        (
-            "examples/attention_scalar.wgsl: keys and values read directly, no workgroup memory",
-            include_str!("attention_scalar.wgsl"),
-            256,
-        ),
         ("examples/attention_tiled.wgsl: the previous kernel, 32 x 32 tiles", include_str!("attention_tiled.wgsl"), 32),
+        ("the engine's kernel on keys 0 .. 63 only (from cache, output not compared)", &cached, 256),
     ];
     let mut timed = Vec::new();
     for (name, src, queries) in others {
@@ -83,11 +89,13 @@ fn main() -> sheetsage2_cpu::Result<()> {
         flops / secs / 1e9
     );
     for (name, (other, other_secs)) in timed {
-        let (d, _) = max_diff(&other, &q[..frames * WIDTH]);
-        println!(
-            "  vs {name}: {:.1} GFLOP/s, {other_secs:.3} s per layer, max |gpu - cpu| {d:.2e}",
-            flops / other_secs / 1e9
-        );
+        let speed = format!("{:.1} GFLOP/s, {other_secs:.3} s per layer", flops / other_secs / 1e9);
+        if name.contains("not compared") {
+            println!("  vs {name}: {speed}");
+        } else {
+            let (d, _) = max_diff(&other, &q[..frames * WIDTH]);
+            println!("  vs {name}: {speed}, max |gpu - cpu| {d:.2e}");
+        }
     }
     Ok(())
 }

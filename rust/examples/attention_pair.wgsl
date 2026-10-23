@@ -1,4 +1,4 @@
-// A variant of src/gpu/attention.wgsl for `gpu_bench`: two threads per query, each keeping half of the q row and
+// A variant of examples/attention_lds.wgsl for `gpu_bench`: two threads per query, each keeping half of the q row and
 // half of the output row (32 dims) in registers, so a thread needs about half the registers and twice as many
 // waves fit on a SIMD.  The two halves of each score are exchanged through workgroup memory.  128 queries per
 // workgroup, keys in blocks of 16.  q, k, v are rows of qkv [frames][3 * 1024] (the scale folded into q); the

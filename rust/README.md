@@ -53,13 +53,14 @@ cargo run --release --features gpu --example gpu_bench -- cpu.safetensors   # ke
 lists what is there; `SHEETSAGE_GPU=<part of the name>` picks an adapter). The log-mel spectrogram, the heads and
 the trackers stay on the CPU. The shaders (`src/gpu/*.wgsl`) compute what the CPU kernels do, in float32 with the
 float16 weights: a 128 x 128-tile GEMM with 8 x 8 outputs per thread, the row norms and convolutions one workgroup
-per row, flash-style attention with one query per thread (its q and output rows in registers, 16 keys and values at
-a time shared through workgroup memory; `gpu_bench` also times variants in `examples/`: two threads per query, keys
-and values read without workgroup memory, and the previous 32 x 32-tile kernel). The shaders are built without the
-iteration limit wgpu puts on every loop, which kept the compiler from unrolling them. GPU memory (on an integrated
-GPU, system memory): 1.2 GB of weights and 264 MB of activations, allocated once for the longest window; the CPU's
-mapping of the weights is dropped after the upload. The work is submitted a block at a time, so no submission runs
-long enough for the driver to reset the GPU.
+per row, flash-style attention with one query per thread (its q and output rows in registers, the keys and values
+read at addresses the whole workgroup shares, so once per wave into scalar registers; `gpu_bench` also times
+variants in `examples/`: keys and values through workgroup memory, two threads per query, the previous 32 x 32-tile
+kernel, and the engine's kernel on cached keys, which shows what reading them from memory costs). The shaders are
+built without the iteration limit wgpu puts on every loop, which kept the compiler from unrolling them. GPU memory
+(on an integrated GPU, system memory): 1.2 GB of weights and 264 MB of activations, allocated once for the longest
+window; the CPU's mapping of the weights is dropped after the upload. The work is submitted a block at a time, so no
+submission runs long enough for the driver to reset the GPU.
 
 Checked on Mesa's software Vulkan (llvmpipe): the logits of a 60 s synthetic song are within 5e-4 of the CPU
 engine's (beats, bars and notes identical) and `gpu_bench`'s linear layers and attention on a whole 300 s window
