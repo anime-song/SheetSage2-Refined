@@ -2,6 +2,7 @@
 
 Beats, downbeats and meters, melody, detailed chords (bass + root x 62 qualities) and keys (with
 modes and modulations) for whole songs.  See ``pipeline.SheetSage2Refined`` and ``python -m sheetsage2_refined``.
+Without the decoder: ``beats.HeadBeats``, ``melody.HeadMelody`` and ``sections.HeadSections``.
 """
 
 from .pipeline import SheetSage2Refined

@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sheetsage2-refined"
-version = "0.3.0"
-description = "Beats, downbeats and meters, melody, detailed chords and keys of whole songs with a fine-tuned SheetSage2"
+version = "0.4.0"
+description = "Beats, downbeats and meters, melody, detailed chords, keys and sections of whole songs with a fine-tuned SheetSage2"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "anime-song" }]
-keywords = ["music transcription", "beat tracking", "downbeat", "time signature", "chord recognition", "key detection", "melody"]
+keywords = ["music transcription", "beat tracking", "downbeat", "time signature", "chord recognition", "key detection", "melody", "music structure analysis"]
 dependencies = [
     "torch>=2.8",
     "torchaudio>=2.8",

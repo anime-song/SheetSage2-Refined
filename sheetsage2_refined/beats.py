@@ -66,16 +66,31 @@ def load_encoder(path: Path, device: str | torch.device = "cpu") -> MERTEncoder:
 
 
 @torch.no_grad()
+def encode_windows(encoder: MERTEncoder, wave: torch.Tensor, device: torch.device):
+    """The encoder states of a 24 kHz waveform in windows of ``WINDOW_SECONDS`` at their own length (as the heads were
+    trained), each with how many of its frames to keep (``None``: all).  A last window too short for the STFT (at most
+    ``n_fft / 2`` samples, the song a few ms longer than a multiple of the window) is padded with silence to 1 s and
+    keeps the frames its own samples cover."""
+
+    config = encoder.config
+    window = round(WINDOW_SECONDS * config.sample_rate)
+    for start in range(0, len(wave), window):
+        piece, keep = wave[start : start + window], None
+        if len(piece) <= config.n_fft // 2:
+            keep = len(piece) // config.samples_per_frame
+            piece = torch.nn.functional.pad(piece, (0, config.sample_rate - len(piece)))
+        with autocast(device):
+            states = encoder(piece[None].to(device))
+        yield states, keep
+
+
 def frame_outputs(encoder: MERTEncoder, head: FrameHead | HeadMean, wave: torch.Tensor, device: torch.device) -> dict[str, torch.Tensor]:
     """A head's 25 Hz outputs (logits, ``[frames, ...]`` on the CPU in float32) for a 24 kHz waveform, encoded in
-    windows of ``WINDOW_SECONDS`` at their own length (as the heads were trained)."""
+    windows (``encode_windows``)."""
 
-    window = round(WINDOW_SECONDS * encoder.config.sample_rate)
     outs = []
-    for start in range(0, len(wave), window):
-        with autocast(device):
-            states = encoder(wave[start : start + window][None].to(device))
-        outs.append(head(states, CHUNK))  # the head runs in float32 (its GRU)
+    for states, keep in encode_windows(encoder, wave, device):
+        outs.append({k: v[:, :keep] for k, v in head(states, CHUNK).items()})  # the head runs in float32 (its GRU)
     return {k: torch.cat([o[k] for o in outs], 1)[0].float().cpu() for k in outs[0]}
 
 

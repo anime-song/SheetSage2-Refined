@@ -7,7 +7,7 @@
 [![Code: MIT](https://img.shields.io/badge/code-MIT-green)](LICENSE)
 [![Weights: CC BY-NC 4.0](https://img.shields.io/badge/weights-CC%20BY--NC%204.0-orange)](https://creativecommons.org/licenses/by-nc/4.0/)
 
-Transcribe whole songs into beats, downbeats and time signatures, melody, chords and keys.
+Transcribe whole songs into beats, downbeats and time signatures, melody, chords, keys and sections.
 A fine-tuned [SheetSage2](https://huggingface.co/m-a-p/SheetSage2); details and results are on the
 [model card](https://huggingface.co/anime-song/SheetSage2-Refined).
 
@@ -16,16 +16,18 @@ A fine-tuned [SheetSage2](https://huggingface.co/m-a-p/SheetSage2); details and 
 SheetSage2 against SheetSage2-Refined on the same held-out songs; the largest gains are on bars and time
 signatures. The last column is the decoder-free heads: the beat tracker
 ([below](#beats-downbeats-and-time-signatures-only-no-decoder)) for beats and bars, the melody head
-([below](#melody-only-no-decoder)) for the melody. The evaluation sets and all scores are on the [model card](https://huggingface.co/anime-song/SheetSage2-Refined#results).
+([below](#melody-only-no-decoder)) for the melody, the section head ([below](#sections-only-no-decoder)) for
+the sections (on [SongFormBench-HarmonixSet](https://huggingface.co/datasets/ASLP-lab/SongFormBench), 200 songs). The evaluation sets and all scores are on the [model card](https://huggingface.co/anime-song/SheetSage2-Refined#results).
 
 <!-- tables:summary -->
-|  | SheetSage2 | SheetSage2-Refined | No decoder (beat / melody heads) |
+|  | SheetSage2 | SheetSage2-Refined | No decoder (beat / melody / section heads) |
 |---|---|---|---|
 | Downbeat F, pop songs (mostly 4/4) | 0.966 | 0.965 | **0.976** |
 | Downbeat F, odd-meter songs | 0.733 | 0.835 | **0.883** |
 | Chords (tetrads), pop songs | 0.678 | **0.770** | — |
 | Key, pop songs | 0.840 | **0.920** | — |
 | Melody F, HookTheory | 0.664 | 0.682 | **0.713** |
+| Section boundary F (±3 s), HarmonixSet | 0.829 | 0.823 | **0.835** |
 <!-- /tables:summary -->
 
 Bars whose two barlines are both found (±70 ms), by time signature, on 50 songs with odd meters and meter changes:
@@ -113,6 +115,26 @@ result["notes"]   # [{"start": 12.34, "end": 12.58, "pitch": 67, "track": 0, "st
 
 `pitch` is the MIDI note (sounding pitch), `track` 0 sung / 1 played, `steps` the note's length in sixteenths and
 `pos` the sixteenth of its beat it starts on. Note times are not placed on the beat grid yet.
+
+### Sections only (no decoder)
+
+A section model on the beat tracker's bars labels the song's phrases (intro, verse, pre-chorus, chorus, bridge,
+interlude, outro, silence) without the decoder, in a few seconds per song on a GPU. It also returns the beat
+tracker's beats and bars. Only SheetSage2's encoder weights and three small heads (34 MB) are downloaded.
+
+```bash
+python -m sheetsage2_refined.sections song.mp3    # -> outputs/sections/song.sections.json
+```
+
+```python
+from sheetsage2_refined.sections import HeadSections
+
+sections = HeadSections.load()
+result = sections.transcribe("song.mp3")
+result["sections"]   # [{"start": 0.09, "end": 18.79, "label": "intro", "bars": 8}, ...]
+```
+
+Sections are phrases, as SheetSage2 writes them: two 8-bar choruses in a row are two sections.
 
 ## License
 
