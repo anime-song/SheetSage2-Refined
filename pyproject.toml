@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sheetsage2-refined"
-version = "0.4.0"
+version = "0.5.0"
 description = "Beats, downbeats and meters, melody, detailed chords, keys and sections of whole songs with a fine-tuned SheetSage2"
 readme = "README.md"
 requires-python = ">=3.10"

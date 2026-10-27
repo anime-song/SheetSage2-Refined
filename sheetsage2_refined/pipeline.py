@@ -24,6 +24,8 @@
                          "decoding": {"onset_weight": 2.0, "start_penalty": 0.5}},
       "section_tracker": {"head": "heads/section-s3.safetensors",  # optional: sections without the decoder (sections.py)
                           "decoding": {"boundary_weight": 8.0, "length_weight": 1.0, "transition_weight": 0.0}},
+      "key_tracker": {"head": "heads/key-k10.safetensors",  # optional: keys without the decoder (keys.py)
+                      "decoding": {"local_weight": 2.0, "boundary_weight": 4.0, "mode_tau": 0.5}},
       "prompts": ["timestamp", "downbeat_meter", "structure", "key", "chord_detail", "melody_full"],
       "mode_tau": 0.2,                                     # with the key_mode prompt (see ``mode_bias``)
       "mode_counts": [...]                                 # one per theory.MODES
@@ -55,6 +57,7 @@ def weight_files(config: dict) -> list[str]:
     melody = config.get("melody_tracker") or {}
     names.extend([melody.get("head"), melody.get("beat_head")])
     names.append((config.get("section_tracker") or {}).get("head"))
+    names.append((config.get("key_tracker") or {}).get("head"))
     for spec in config.get("rescoring", {}).values():
         names.extend(spec["head"] if isinstance(spec["head"], list) else [spec["head"]])
     return sorted({name for name in names if name})

@@ -144,10 +144,25 @@ class SectionModel(nn.Module):
         ``bar_melody`` [B, N, 16 * 12] (the pitch classes of the bar's first four beats' sixteenths).  Per bar
         logits ``label`` [B, N, labels], ``boundary`` [B, N], ``phrase`` [B, N, 16]."""
 
+        y = self.encode(batch)
+        return {"label": self.label(y), "boundary": self.boundary(y)[..., 0], "phrase": self.phrase(y)}
+
+    def beat_inputs(self, batch: dict[str, Tensor]) -> Tensor:
         states = batch["states"].float()
         x = sum(project(states[:, :, g]) for g, project in enumerate(self.states))
         if self.melody is not None:
             x = x + self.melody(torch.cat([batch["melody"].float().flatten(2), batch["vocal"].float()[..., None]], -1))
+        return x
+
+    def bar_inputs(self, batch: dict[str, Tensor]) -> Tensor | float:
+        """Per-bar inputs added to the pooled beats (none here)."""
+
+        return 0.0
+
+    def encode(self, batch: dict[str, Tensor]) -> Tensor:
+        """One vector per bar ``[B, N, width]`` (``forward``'s batch)."""
+
+        x = self.beat_inputs(batch)
         beat_mask = (batch["beat_bar"] >= 0).float()
         x = x + self.beat_position(batch["beat_position"].clamp(0, MAX_BAR_BEATS - 1))
         for layer in self.beat_layers:
@@ -160,6 +175,7 @@ class SectionModel(nn.Module):
         where = torch.arange(bars, device=x.device)[None] / count  # 0..1 over the song's bars
         fourier = torch.cat([f(math.pi * k * where[..., None]) for k in (1, 2, 4, 8) for f in (torch.sin, torch.cos)], -1)
         y = pooled + self.bar_beats(batch["bar_beats"].clamp(0, MAX_BAR_BEATS)) + self.song_position(fourier)
+        y = y + self.bar_inputs(batch)
         offsets = torch.arange(bars, device=x.device)
         distance = (offsets[None, :] - offsets[:, None]).clamp(-self.relative, self.relative) + self.relative
         padding = torch.where(mask, 0.0, -1e9)[:, None, None, :]  # [B, 1, 1, N]
@@ -171,8 +187,7 @@ class SectionModel(nn.Module):
             if similar is not None:
                 bias = bias + torch.einsum("hk,bkij->bhij", self.similar[i], similar)
             y = layer(y, bias)
-        y = self.norm(y)
-        return {"label": self.label(y), "boundary": self.boundary(y)[..., 0], "phrase": self.phrase(y)}
+        return self.norm(y)
 
 
 def cosine(x: Tensor) -> Tensor:
@@ -425,17 +440,22 @@ class HeadSections:
         return cls(beats, melody, sections, priors, device, **decoding)
 
     @torch.no_grad()
-    def frames(self, wave: Tensor) -> dict:
+    def frames(self, wave: Tensor, chord: FrameHead | None = None) -> dict:
         """One encoder pass per window for a 24 kHz waveform: the beat head's probabilities (``probs``, as
         ``HeadBeats.probabilities``), the states averaged over ``BLOCKS`` (``states`` [frames, groups, 1024] float16),
-        the melody line (``pitch`` [frames, 89]) and how sung each frame is (``sung`` [frames])."""
+        the melody line (``pitch`` [frames, 89]) and how sung each frame is (``sung`` [frames]); with a ``chord`` head
+        also its chord (``chord`` [frames, 38]: the root and bass softmaxes, 12 + N, and the 12 tones' sigmoids)."""
 
         encoder, beat_head = self.beats.encoder, self.beats.head
-        groups, beat_out, melody_out = [], [], []
+        groups, beat_out, melody_out, chord_out = [], [], [], []
         for states, keep in encode_windows(encoder, wave, self.device):  # as beats.frame_outputs, keeping the states
             groups.append(torch.stack([torch.stack(states[lo:hi]).float().mean(0)[0] for lo, hi in BLOCKS], 1)[:keep].half())
             beat_out.append({k: v[:, :keep] for k, v in beat_head(states, CHUNK).items()})
             melody_out.append({k: v[:, :keep] for k, v in self.melody(states, CHUNK).items()})
+            if chord is not None:
+                c = chord(states, CHUNK)
+                chord_out.append(torch.cat([torch.softmax(c["root"].float(), -1), torch.softmax(c["bass"].float(), -1),
+                                            torch.sigmoid(c["tones"].float())], -1)[0, :keep].cpu())  # fmt: skip
             del states
         out = {k: torch.cat([o[k] for o in beat_out], 1)[0].float().cpu() for k in beat_out[0]}
         probs = {k: torch.sigmoid(out[k]).numpy() for k in ("beat", "downbeat")}
@@ -444,8 +464,11 @@ class HeadSections:
         mel = {k: torch.cat([o[k] for o in melody_out], 1)[0].float() for k in ("melody_pitch", "melody_vocal")}
         pitch = torch.softmax(mel["melody_pitch"], -1)
         sung = (1 - pitch[:, 0]) * torch.sigmoid(mel["melody_vocal"])
-        return {"probs": probs, "states": torch.cat(groups).cpu(), "pitch": pitch.cpu().numpy(), "sung": sung.cpu().numpy(),
-                "duration": len(wave) / encoder.config.sample_rate}  # fmt: skip
+        result = {"probs": probs, "states": torch.cat(groups).cpu(), "pitch": pitch.cpu().numpy(), "sung": sung.cpu().numpy(),
+                  "duration": len(wave) / encoder.config.sample_rate}  # fmt: skip
+        if chord is not None:
+            result["chord"] = torch.cat(chord_out)
+        return result
 
     @torch.no_grad()
     def sections(self, frames: dict) -> dict:
