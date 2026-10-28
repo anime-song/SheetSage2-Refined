@@ -7,7 +7,7 @@
 [![Code: MIT](https://img.shields.io/badge/code-MIT-green)](LICENSE)
 [![Weights: CC BY-NC 4.0](https://img.shields.io/badge/weights-CC%20BY--NC%204.0-orange)](https://creativecommons.org/licenses/by-nc/4.0/)
 
-Transcribe whole songs into beats, downbeats and time signatures, melody, chords and keys.
+Transcribe whole songs into beats, downbeats and time signatures, melody, chords, keys and sections.
 A fine-tuned [SheetSage2](https://huggingface.co/m-a-p/SheetSage2); details and results are on the
 [model card](https://huggingface.co/anime-song/SheetSage2-Refined).
 
@@ -16,16 +16,20 @@ A fine-tuned [SheetSage2](https://huggingface.co/m-a-p/SheetSage2); details and 
 SheetSage2 against SheetSage2-Refined on the same held-out songs; the largest gains are on bars and time
 signatures. The last column is the decoder-free heads: the beat tracker
 ([below](#beats-downbeats-and-time-signatures-only-no-decoder)) for beats and bars, the melody head
-([below](#melody-only-no-decoder)) for the melody. The evaluation sets and all scores are on the [model card](https://huggingface.co/anime-song/SheetSage2-Refined#results).
+([below](#melody-only-no-decoder)) for the melody, the section head ([below](#sections-only-no-decoder)) for
+the sections (on [SongFormBench-HarmonixSet](https://huggingface.co/datasets/ASLP-lab/SongFormBench), 200 songs), the
+key head ([below](#keys-only-no-decoder)) for the keys. The evaluation sets and all scores are on the [model card](https://huggingface.co/anime-song/SheetSage2-Refined#results).
 
 <!-- tables:summary -->
-|  | SheetSage2 | SheetSage2-Refined | No decoder (beat / melody heads) |
+|  | SheetSage2 | SheetSage2-Refined | No decoder (beat / melody / section / key heads) |
 |---|---|---|---|
 | Downbeat F, pop songs (mostly 4/4) | 0.966 | 0.965 | **0.976** |
 | Downbeat F, odd-meter songs | 0.733 | 0.835 | **0.883** |
 | Chords (tetrads), pop songs | 0.678 | **0.770** | — |
-| Key, pop songs | 0.840 | **0.920** | — |
+| Key, pop songs | 0.825 | 0.911 | **0.934** |
+| Key changes F, pop songs | 0.560 | 0.646 | **0.735** |
 | Melody F, HookTheory | 0.664 | 0.682 | **0.713** |
+| Section boundary F (±3 s), HarmonixSet | 0.829 | 0.823 | **0.835** |
 <!-- /tables:summary -->
 
 Bars whose two barlines are both found (±70 ms), by time signature, on 50 songs with odd meters and meter changes:
@@ -113,6 +117,48 @@ result["notes"]   # [{"start": 12.34, "end": 12.58, "pitch": 67, "track": 0, "st
 
 `pitch` is the MIDI note (sounding pitch), `track` 0 sung / 1 played, `steps` the note's length in sixteenths and
 `pos` the sixteenth of its beat it starts on. Note times are not placed on the beat grid yet.
+
+### Sections only (no decoder)
+
+A section model on the beat tracker's bars labels the song's phrases (intro, verse, pre-chorus, chorus, bridge,
+interlude, outro, silence) without the decoder, in a few seconds per song on a GPU. It also returns the beat
+tracker's beats and bars. Only SheetSage2's encoder weights and three small heads (34 MB) are downloaded.
+
+```bash
+python -m sheetsage2_refined.sections song.mp3    # -> outputs/sections/song.sections.json
+```
+
+```python
+from sheetsage2_refined.sections import HeadSections
+
+sections = HeadSections.load()
+result = sections.transcribe("song.mp3")
+result["sections"]   # [{"start": 0.09, "end": 18.79, "label": "intro", "bars": 8}, ...]
+```
+
+Sections are phrases, as SheetSage2 writes them: two 8-bar choruses in a row are two sections.
+
+### Keys only (no decoder)
+
+A key model on the beat tracker's bars reads each bar's key with its mode and where the key changes, without the
+decoder, in a few seconds per song on a GPU. It reads the encoder's states with the chord head's chords and the melody
+head's notes, once over the whole song and once from the chords and melody around each bar, so that brief key changes
+are not smoothed away. It also returns the beat tracker's beats and bars. Only SheetSage2's encoder weights and four
+small heads (70 MB) are downloaded.
+
+```bash
+python -m sheetsage2_refined.keys song.mp3        # -> outputs/keys/song.keys.json
+```
+
+```python
+from sheetsage2_refined.keys import HeadKeys
+
+keys = HeadKeys.load()
+result = keys.transcribe("song.mp3")
+result["keys"]   # [{"start": 0.0, "end": 12.18, "key": "F:major", "bars": 8}, {"start": 12.18, ...}, ...]
+```
+
+Keys change on barlines of the beat tracker.
 
 ### On the CPU (Rust engine, no Python at run time)
 
