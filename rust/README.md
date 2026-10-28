@@ -1,7 +1,8 @@
 # sheetsage2-cpu
 
-SheetSage2's MERT-v2 encoder, SheetSage2-Refined's beat and melody heads and their trackers on the CPU, in Rust, for
-machines without a GPU. One pass of the encoder feeds both heads; no Python or PyTorch at run time.
+SheetSage2's MERT-v2 encoder, SheetSage2-Refined's beat and melody heads and their trackers, and its section and key
+models, on the CPU, in Rust, for machines without a GPU. One pass of the encoder feeds all the heads; no Python or
+PyTorch at run time.
 
 ## Use
 
@@ -9,12 +10,16 @@ machines without a GPU. One pass of the encoder feeds both heads; no Python or P
 python -m sheetsage2_refined.export_cpu cpu.safetensors [--dtype f16|f32|i8] [--lora ADAPTER --lora-scale S]
 cargo build --release
 ./target/release/sheetsage2-cpu --weights cpu.safetensors [--adapter LORA] [--threads N] [--out-dir DIR] \
-    [--heads beat,melody] [--tempo-weight W] [--logits] song.mp3 ...
+    [--heads beat,melody,section,key] [--tempo-weight W] [--logits] song.mp3 ...
 ```
 
-writes `<out-dir>/<song>.beats.json` and `<song>.melody.json` (default `outputs/cpu/`) as
-`python -m sheetsage2_refined.beats` / `.melody` do; `--logits` also writes the heads' logits
-(`<song>.heads.safetensors`) and `--from-logits` runs only the trackers on such files.
+writes `<out-dir>/<song>.beats.json`, `<song>.melody.json`, `<song>.sections.json` and `<song>.keys.json` (those
+`--heads` names, default `beat,melody`; default directory `outputs/cpu/`) as `python -m sheetsage2_refined.beats` /
+`.melody` / `.sections` / `.keys` do, with the decoding settings of the exported model's `config.json`. `section`
+and `key` run the beat and melody heads as well, `key` also the chord head (`rescoring.quality`); the heads share
+one pass of the encoder. `--logits` also writes the heads' logits and, for `section` / `key`, the encoder states'
+block means (`<song>.heads.safetensors`), and `--from-logits` runs only the trackers and the section and key models
+on such files. Weights exported before the section and key models were added hold neither: export them again.
 
 `--threads` defaults to one per logical CPU; on a CPU with SMT try the number of physical cores as well.
 WAV, FLAC, MP3 and Ogg Vorbis are decoded by Symphonia and resampled to 24 kHz as `torchaudio.functional.resample`
@@ -95,6 +100,10 @@ within 2e-5. Its speed has to be measured on the GPU it runs on:
 * The heads (`src/heads.rs`) run their GRU on 60 s pieces with 15 s of context, as `heads.CHUNK`, in parallel.
 * The trackers (`src/tracker.rs`, `src/melody.rs`) are `bar_tracker.py` and `melody.py`'s `line_notes` / `notes`
   line by line, the beat tracker's interval transitions as AVX2 max-plus products.
+* The section and key models (`src/bars.rs`) read the encoder states averaged over three groups of blocks, which
+  the encoder adds up as three more layer mixes and keeps per frame as float16, as `sections.HeadSections.frames`
+  does. The per-beat features, both models (the key model with its local reading), `segments` and the key
+  `decode` follow `sections.py` and `keys.py`; they take well under a second per song.
 
 ## Accuracy
 
@@ -112,6 +121,11 @@ meter changes) when no audio is at hand. On a 330 s synthetic song (two encoder 
 Differences of a few hundredths are the model's own sensitivity: a waveform that differs by 2.5e-6 (resampling in
 float64 or float32) moves the logits as much. The Rust trackers give the same beats, bars, meters and notes as the
 Python ones on the logits of both songs and on 20 noisy copies (noise up to 3 on every logit).
+
+`scripts/check_bars.py` runs the Python section and key models on the engine's logits and block means
+(`--heads section,key --logits`) and compares the sections and keys with the engine's. On the synthetic songs
+(60, 100 and 330 s, and one a few samples over a 300 s window) they are equal; the section model's logits differ
+by at most 1e-4 and the key log-probabilities by at most 0.002.
 
 ## Speed and memory
 

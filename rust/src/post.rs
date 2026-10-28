@@ -19,7 +19,7 @@ fn softmax(x: &[f32]) -> Vec<f32> {
 }
 
 /// `round(x, 4)` as Python writes it.
-fn r4(x: f64) -> f64 {
+pub fn r4(x: f64) -> f64 {
     format!("{x:.4}").parse().unwrap()
 }
 
@@ -58,7 +58,11 @@ pub fn beats_json(
     tempo_weight: f64,
 ) -> Result<Value, String> {
     let probs = beat_probs(outputs)?;
-    let t = tracker::track_beats(&probs, options, tempo_weight);
+    Ok(tracked_json(&tracker::track_beats(&probs, options, tempo_weight), audio, duration))
+}
+
+/// The beat tracker's dict as `beats.json` holds it (`beats` and `downbeats` rounded as there).
+pub fn tracked_json(t: &tracker::Tracked, audio: &str, duration: f64) -> Value {
     let bars: Vec<Value> = t
         .bars
         .iter()
@@ -67,14 +71,14 @@ pub fn beats_json(
             None => json!({"start": r4(b.start), "beats": b.beats}),
         })
         .collect();
-    Ok(json!({
+    json!({
         "audio": audio,
         "duration": duration,
         "beats": t.beats.iter().map(|&b| r4(b)).collect::<Vec<_>>(),
         "downbeats": t.downbeats.iter().map(|&d| r4(d)).collect::<Vec<_>>(),
         "bars": bars,
         "meters": t.meters,
-    }))
+    })
 }
 
 /// The melody decoding settings stored by `export_cpu` (`melody_tracker.decoding`).

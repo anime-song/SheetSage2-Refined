@@ -43,7 +43,7 @@ impl Mix {
         if layer == 0 {
             self.sum.clear();
             self.sum.extend(state.iter().map(|v| w * v));
-        } else {
+        } else if w != 0.0 {
             self.sum.par_chunks_mut(1 << 14).zip(state.par_chunks(1 << 14)).for_each(|(s, x)| {
                 for (s, x) in s.iter_mut().zip(x) {
                     *s += w * x;

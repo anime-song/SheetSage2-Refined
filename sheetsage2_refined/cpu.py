@@ -43,6 +43,7 @@ def head_outputs(layers: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         m = layers["melody"]
         out |= {"melody": m[:, :MELODY_KEYS], "melody_on": m[:, MELODY_KEYS : 2 * MELODY_KEYS],
                 "melody_offset": m[:, -2], "melody_vocal": m[:, -1]}  # fmt: skip
+    out |= {name: layers[name] for name in ("root", "bass", "tones") if name in layers}  # the chord head
     if "line" in layers:
         line = layers["line"]
         out |= dict(zip(LINE, np.split(line[:, :-3], np.cumsum(list(LINE.values()))[:-1], axis=-1)))

@@ -1,11 +1,11 @@
-//! Frame heads (`sheetsage2_refined/heads.py`'s `FrameHead`) on a layer mix: norm, linear + GELU, two grouped
-//! convolutions, a bidirectional GRU (on 60 s pieces with 15 s of context either side, as `CHUNK`) and the output
-//! layers the trackers read.
+//! Frame heads (`sheetsage2_refined/heads.py`'s `FrameHead`) on one or more layer mixes: norm (each mix), linear +
+//! GELU, two grouped convolutions, a bidirectional GRU (on 60 s pieces with 15 s of context either side, as `CHUNK`)
+//! and the output layers the trackers and the key model read.
 
 use rayon::prelude::*;
 
 use crate::Result;
-use crate::encoder::WIDTH;
+use crate::encoder::{STATES, WIDTH};
 use crate::gemm::{self, Act, MR, NR};
 use crate::math;
 use crate::weights::{Linear, Weights};
@@ -21,7 +21,7 @@ struct Gru {
 }
 
 pub struct Head {
-    pub mix: &'static [f32],
+    pub mixes: Vec<&'static [f32]>, // softmax weights over the encoder states, one row per mix
     inp: Linear,
     convs: Vec<(Vec<f32>, &'static [f32])>, // weights [groups][TAPS][GROUP in][GROUP out], bias
     rnn: Vec<[Gru; 2]>,
@@ -61,22 +61,33 @@ impl Head {
             rnn.push([gru("fwd")?, gru("bwd")?]);
         }
         let mut outputs = Vec::new();
-        for layer in ["binary", "bar", "offset", "unit", "melody", "line"] {
+        for layer in ["binary", "bar", "offset", "unit", "melody", "line", "root", "bass", "tones"] {
             let key = format!("{p}.out.{layer}");
             if w.has(&format!("{key}.w")) {
                 outputs.push((layer.to_string(), w.linear(&key)?));
             }
         }
-        Ok(Self { mix: w.f32(&format!("{p}.mix"))?, inp, convs, rnn, outputs })
+        let mix = w.f32(&format!("{p}.mix"))?;
+        let mixes: Vec<&'static [f32]> = mix.chunks(STATES).collect();
+        if mix.len() % STATES != 0 || inp.k != mixes.len() * WIDTH {
+            return Err(format!("{p}: {} mix weights for an input of {}", mix.len(), inp.k).into());
+        }
+        Ok(Self { mixes, inp, convs, rnn, outputs })
     }
 
-    /// The output layers' logits for a layer mix `[frames, WIDTH]`: `(name, width, [frames, width])`.
-    pub fn forward(&self, mixed: &[f32], frames: usize) -> Vec<(String, usize, Vec<f32>)> {
+    /// The output layers' logits for the layer mixes (one per `mixes` row, `[frames, WIDTH]` each):
+    /// `(name, width, [frames, width])`.
+    pub fn forward(&self, mixed: &[&[f32]], frames: usize) -> Vec<(String, usize, Vec<f32>)> {
         let hidden = self.inp.n;
-        let mut norm = vec![0.0f32; frames * WIDTH];
-        norm.par_chunks_mut(WIDTH).zip(mixed.par_chunks(WIDTH)).for_each(|(o, x)| math::normalize(x, o, 1e-5));
+        let width = mixed.len() * WIDTH;
+        let mut norm = vec![0.0f32; frames * width];
+        norm.par_chunks_mut(width).enumerate().for_each(|(t, o)| {
+            for (o, m) in o.chunks_mut(WIDTH).zip(mixed) {
+                math::normalize(&m[t * WIDTH..(t + 1) * WIDTH], o, 1e-5);
+            }
+        });
         let mut x = vec![0.0f32; frames * hidden];
-        gemm::linear(&norm, WIDTH, frames, &self.inp, &mut x, hidden, Act::Gelu, false, None);
+        gemm::linear(&norm, width, frames, &self.inp, &mut x, hidden, Act::Gelu, false, None);
         drop(norm);
         for (w, b) in &self.convs {
             let y = grouped_conv(&x, frames, hidden, w, b);

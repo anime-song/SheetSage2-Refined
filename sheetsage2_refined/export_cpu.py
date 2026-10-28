@@ -1,4 +1,5 @@
-"""Export SheetSage2's encoder and the beat / melody heads for the Rust CPU engine (``rust/``).
+"""Export SheetSage2's encoder, the beat / melody heads and the section / key models (with the chord head the keys
+read) for the Rust CPU engine (``rust/``).
 
     python -m sheetsage2_refined.export_cpu out.safetensors [--model REPO_OR_FOLDER] [--dtype f16|f32|i8]
                                             [--lora LORA.safetensors --lora-scale S]
@@ -12,10 +13,14 @@ folded here:
   pairs of frames, and GRN's shift ``beta`` into ``fc2``'s bias (its per-channel scale depends on the song and is
   applied by the engine),
 * the rotary tables (bfloat16-rounded, as ``encoder.rotary_tables``) are stored for the longest window,
-* each head's layer mix is stored as softmax weights, and its LayerNorm goes into its first linear layer.
+* each head's layer mixes are stored as softmax weights, and its LayerNorm goes into its first linear layer,
+* the section and key models' per-beat inputs (the three state groups' LayerNorms and linear layers, the melody's and
+  the chord's) become one linear layer, and their attention blocks' and final LayerNorms go into the layers they
+  feed (``--no-bar-models`` leaves the section and key models and the chord head out).
 
 Linear weights are stored in panels of 16 output channels, ``[ceil(N / 16), K, 16]``, the order the engine's matrix
-kernels read them in, as float16 (default), float32 or int8 with a scale per output channel.  The heads stay float32.
+kernels read them in, as float16 (default), float32 or int8 with a scale per output channel.  The heads and the
+section and key models stay float32.
 
 ``--lora`` merges a LoRA adapter into the encoder before folding (``W += scale * B @ A``), with keys named
 ``<module>.lora_A.weight`` / ``<module>.lora_B.weight`` as PEFT writes them, ``<module>`` an encoder module name such
@@ -43,12 +48,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from safetensors import safe_open
 from safetensors.numpy import save_file
 from safetensors.torch import load_file
 
+from .beats import beat_files
 from .encoder import EncoderConfig, rotary_tables
 from .heads import BAR, BINARY, LINE, MELODY_KEYS, OFFSETS, UNITS
-from .beats import beat_files
 from .melody import melody_files
 from .model import WINDOW_SECONDS
 from .pipeline import DEFAULT_MODEL, model_folder
@@ -253,17 +259,22 @@ def export_encoder(out: Writer, state: dict[str, np.ndarray], config: EncoderCon
     out.vector("rope.sin", sin[0, :, 0, : head_dim // 2].numpy())
 
 
-def export_head(out: Writer, name: str, state: dict[str, np.ndarray]) -> dict:
-    """A ``heads.FrameHead`` (one layer mix) without the outputs neither tracker reads."""
+HEAD_OUTPUTS = ("binary", "bar", "offset", "unit", "melody", "line")  # what the beat and melody trackers read
+CHORD_OUTPUTS = ("root", "bass", "tones")  # what the key model reads of the chord head
+
+
+def export_head(out: Writer, name: str, state: dict[str, np.ndarray], outputs=HEAD_OUTPUTS) -> dict:
+    """A ``heads.FrameHead`` with only the output layers in ``outputs``.  A head with several layer mixes reads
+    them side by side, each normalised by the one LayerNorm."""
 
     s = state
-    if s["mix"].ndim != 1:
-        raise ValueError(f"{name}: the engine supports heads with one layer mix")
     if "extra.weight" in s:
         raise ValueError(f"{name}: heads that read a beat head's bar facts are not supported yet")
     p = f"heads.{name}"
-    out.vector(f"{p}.mix", torch.softmax(torch.from_numpy(s["mix"]), -1).numpy())
-    out.linear(f"{p}.inp", *fold_norm(s["inp.weight"], s["inp.bias"], s["norm.weight"], s["norm.bias"]), dtype="f32")
+    mix = torch.softmax(torch.from_numpy(s["mix"]).reshape(-1, s["mix"].shape[-1]), -1).numpy()
+    out.vector(f"{p}.mix", mix)  # [mixes, 25]
+    gamma, beta = (np.tile(s[f"norm.{k}"], len(mix)) for k in ("weight", "bias"))
+    out.linear(f"{p}.inp", *fold_norm(s["inp.weight"], s["inp.bias"], gamma, beta), dtype="f32")
     for i in range(2):
         out.vector(f"{p}.convs.{i}.w", s[f"convs.{i}.weight"])  # [C, C / groups, 9]
         out.vector(f"{p}.convs.{i}.b", s[f"convs.{i}.bias"])
@@ -274,12 +285,77 @@ def export_head(out: Writer, name: str, state: dict[str, np.ndarray]) -> dict:
             out.linear(f"{q}.ih", s[f"rnn.weight_ih_l{layer}{suffix}"], s[f"rnn.bias_ih_l{layer}{suffix}"], dtype="f32")
             out.vector(f"{q}.hh.w", s[f"rnn.weight_hh_l{layer}{suffix}"])  # [3 H, H], gates r, z, n
             out.vector(f"{q}.hh.b", s[f"rnn.bias_hh_l{layer}{suffix}"])
-    outputs = {}
-    for layer in ("binary", "bar", "offset", "unit", "melody", "line"):
+    written = {}
+    for layer in outputs:
         if f"{layer}.weight" in s:
             out.linear(f"{p}.out.{layer}", s[f"{layer}.weight"], s[f"{layer}.bias"], dtype="f32")
-            outputs[layer] = int(s[f"{layer}.weight"].shape[0])
-    return {"rnn_layers": layers, "hidden": int(s["inp.weight"].shape[0]), "outputs": outputs}
+            written[layer] = int(s[f"{layer}.weight"].shape[0])
+    return {"mixes": len(mix), "rnn_layers": layers, "hidden": int(s["inp.weight"].shape[0]), "outputs": written}
+
+
+def export_conv_block(out: Writer, p: str, s: dict[str, np.ndarray], q: str) -> None:
+    """A ``sections.ConvBlock`` (its LayerNorm stays: the depthwise convolution after it pads with zeros)."""
+
+    out.vector(f"{p}.norm.w", s[f"{q}.norm.weight"])
+    out.vector(f"{p}.norm.b", s[f"{q}.norm.bias"])
+    out.vector(f"{p}.depth.w", s[f"{q}.depth.weight"][:, 0])  # [C, kernel]
+    out.vector(f"{p}.depth.b", s[f"{q}.depth.bias"])
+    out.linear(f"{p}.point", s[f"{q}.point.weight"], s[f"{q}.point.bias"], dtype="f32")
+    out.linear(f"{p}.out", s[f"{q}.out.weight"], s[f"{q}.out.bias"], dtype="f32")
+
+
+def export_bar_model(out: Writer, p: str, s: dict[str, np.ndarray], config: dict, outputs: tuple[str, ...]) -> None:
+    """A ``sections.SectionModel`` or ``keys.KeyModel``.  The per-beat inputs are one linear layer over the three
+    normalised state groups, the melody (4 x 13), the sung share and the chord (38, keys only), side by side; the
+    pre-LayerNorms of the attention blocks and the final one go into the linear layers they feed."""
+
+    groups = sum(1 for k in s if re.fullmatch(r"states\.\d+\.1\.weight", k))
+    weights, bias = [], 0.0
+    for g in range(groups):
+        w, b = fold_norm(s[f"states.{g}.1.weight"], s[f"states.{g}.1.bias"], s[f"states.{g}.0.weight"], s[f"states.{g}.0.bias"])
+        weights.append(w)
+        bias = bias + b
+    for name in ("melody", "chord"):
+        if f"{name}.weight" in s:
+            weights.append(s[f"{name}.weight"])
+            bias = bias + s[f"{name}.bias"]
+    out.linear(f"{p}.beat_in", np.concatenate(weights, 1), bias, dtype="f32")
+    out.vector(f"{p}.beat_position", s["beat_position.weight"])
+    out.vector(f"{p}.bar_beats", s["bar_beats.weight"])
+    out.linear(f"{p}.song_position", s["song_position.weight"], s["song_position.bias"], dtype="f32")
+    for i in range(config["beat_layers"]):
+        export_conv_block(out, f"{p}.beat_layers.{i}", s, f"beat_layers.{i}")
+    for i in range(config["bar_layers"]):
+        q, r = f"bar_layers.{i}", f"{p}.bar_layers.{i}"
+        out.linear(f"{r}.qkv", *fold_norm(s[f"{q}.qkv.weight"], s[f"{q}.qkv.bias"], s[f"{q}.norm1.weight"], s[f"{q}.norm1.bias"]), dtype="f32")
+        out.linear(f"{r}.proj", s[f"{q}.proj.weight"], s[f"{q}.proj.bias"], dtype="f32")
+        out.linear(f"{r}.ff1", *fold_norm(s[f"{q}.ff.0.weight"], s[f"{q}.ff.0.bias"], s[f"{q}.norm2.weight"], s[f"{q}.norm2.bias"]), dtype="f32")
+        out.linear(f"{r}.ff2", s[f"{q}.ff.3.weight"], s[f"{q}.ff.3.bias"], dtype="f32")
+    out.vector(f"{p}.distance", s["distance"])  # [layers, heads, 2 * relative + 1]
+    if "similar" in s:
+        out.vector(f"{p}.similar", s["similar"])  # [layers, heads, 2]: melody, states
+    for name in outputs:
+        out.linear(f"{p}.out.{name}", *fold_norm(s[f"{name}.weight"], s[f"{name}.bias"], s["norm.weight"], s["norm.bias"]), dtype="f32")
+    if "local.input.weight" in s:
+        out.linear(f"{p}.local.input", s["local.input.weight"], s["local.input.bias"], dtype="f32")
+        out.vector(f"{p}.local.beat_position", s["local.beat_position.weight"])
+        for kind in ("beat_layers", "bar_layers"):
+            for i in range(sum(1 for k in s if re.fullmatch(rf"local\.{kind}\.\d+\.point\.weight", k))):
+                export_conv_block(out, f"{p}.local.{kind}.{i}", s, f"local.{kind}.{i}")
+        w, b = fold_norm(s["local.head.1.weight"], s["local.head.1.bias"], s["local.head.0.weight"], s["local.head.0.bias"])
+        out.linear(f"{p}.local.head", w, b, dtype="f32")
+    for name in ("first", "transition", "length", "last"):
+        if f"priors.{name}" in s:
+            out.vector(f"{p}.priors.{name}", s[f"priors.{name}"])
+
+
+def bar_model_files(config: dict) -> list[str]:
+    """The section and key models of a model folder and the chord head the keys read, those it has."""
+
+    names = [(config.get(k) or {}).get("head") for k in ("section_tracker", "key_tracker")]
+    if (config.get("key_tracker") or {}).get("head"):
+        names.append(config["rescoring"]["quality"]["head"])
+    return [n for n in names if n]
 
 
 def main() -> None:
@@ -291,9 +367,11 @@ def main() -> None:
     parser.add_argument("--lora", type=Path, help="a LoRA adapter for the encoder, merged before export")
     parser.add_argument("--lora-scale", type=float, default=1.0, help="the adapter's alpha / rank")
     parser.add_argument("--adapter", type=Path, help="write only this LoRA adapter, for the engine's --adapter")
+    parser.add_argument("--no-bar-models", action="store_true", help="leave out the section and key models")
     args = parser.parse_args()
 
-    folder = model_folder(args.model, args.revision, lambda config: [*beat_files(config), *melody_files(config)])
+    folder = model_folder(args.model, args.revision,
+                          lambda config: [*beat_files(config), *melody_files(config), *bar_model_files(config)])
     model = json.loads((folder / "config.json").read_text(encoding="utf-8"))
     weights = load_file(str(folder / model["base_weights"]))
     state = {k[len("encoder."):]: v.float().numpy() for k, v in weights.items() if k.startswith("encoder.")}
@@ -310,12 +388,31 @@ def main() -> None:
     for name, key in (("beat", "beat_tracker"), ("melody", "melody_tracker")):
         head = {k: v.float().numpy() for k, v in load_file(str(folder / model[key]["head"])).items()}
         heads[name] = export_head(out, name, head) | {"file": model[key]["head"]}
+    bar_models = {}
+    for name, key, outputs in (("sections", "section_tracker", ("label", "boundary", "phrase")),
+                               ("keys", "key_tracker", ("key", "boundary"))):  # fmt: skip
+        spec = model.get(key) or {}
+        if not spec.get("head") or args.no_bar_models:
+            continue
+        if name == "keys":
+            chord = model["rescoring"]["quality"]["head"]
+            state = {k: v.float().numpy() for k, v in load_file(str(folder / chord)).items()}
+            heads["chord"] = export_head(out, "chord", state, CHORD_OUTPUTS) | {"file": chord}
+        with safe_open(str(folder / spec["head"]), "pt") as handle:
+            config_ = json.loads(handle.metadata()["config"])
+        if config_.get("sections"):
+            raise ValueError(f"{spec['head']}: key models that read the section model are not supported")
+        state = {k: v.float().numpy() for k, v in load_file(str(folder / spec["head"])).items()}
+        export_bar_model(out, name, state, config_, outputs)
+        bar_models[name] = {"file": spec["head"], "config": config_, "decoding": spec.get("decoding") or {}}
     metadata = {
         "format": FORMAT,
         "dtype": args.dtype,
         "model": model.get("name", str(args.model)),
         "heads": json.dumps(heads),
         "melody_decoding": json.dumps((model.get("melody_tracker") or {}).get("decoding") or {}),
+        "bar_models": json.dumps(bar_models),
+        "mode_counts": json.dumps(model.get("mode_counts") or []),
         "names": json.dumps({"binary": BINARY, "bar": BAR, "offset": OFFSETS, "unit": UNITS, "line": LINE,
                              "melody_keys": MELODY_KEYS}),  # fmt: skip
     }

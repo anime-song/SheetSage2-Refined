@@ -4,6 +4,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 pub mod audio;
+pub mod bars;
 pub mod encoder;
 pub mod gemm;
 #[cfg(feature = "gpu")]
@@ -18,7 +19,8 @@ pub mod simd;
 pub mod tracker;
 pub mod weights;
 
-use encoder::{Encoder, Mix, SAMPLE_RATE};
+use bars::BarModel;
+use encoder::{Encoder, Mix, N_FFT, SAMPLE_RATE, SAMPLES_PER_FRAME, WIDTH};
 use heads::Head;
 use weights::Weights;
 
@@ -29,40 +31,73 @@ pub const WINDOW_SAMPLES: usize = 300 * SAMPLE_RATE;
 
 pub struct Model {
     pub encoder: Encoder,
-    /// The encoder on a GPU instead (`load_gpu`).
     #[cfg(feature = "gpu")]
     pub gpu: Option<gpu::GpuEncoder>,
     pub heads: Vec<(String, Head)>,
+    /// The section and key models (`--heads section,key`), which read the encoder states' block means.
+    pub sections: Option<BarModel>,
+    pub keys: Option<BarModel>,
     pub weights: Weights,
 }
 
-/// One head's outputs over a whole song: `(output name, width, [frames, width] logits)`.
 pub type Outputs = Vec<(String, usize, Vec<f32>)>;
 
+/// A song's 25 Hz outputs: per frame head its logits, and the encoder states averaged over `bars::BLOCKS`
+/// (`[frames, 3 * WIDTH]` float16 bits; empty without a bar model).
+pub struct Frames {
+    pub heads: Vec<(String, Outputs)>,
+    pub states: Vec<u16>,
+}
+
 impl Model {
-    pub fn load(path: &std::path::Path, heads: &[&str]) -> Result<Self> {
+    /// `outputs`: frame heads (`beat`, `melody`, `chord`) and bar models (`section`, `key`); a bar model loads the
+    /// frame heads it reads.
+    pub fn load(path: &std::path::Path, outputs: &[&str]) -> Result<Self> {
         let weights = Weights::open(path)?;
         let encoder = Encoder::load(&weights)?;
-        let heads = heads.iter().map(|&h| Ok((h.to_string(), Head::load(&weights, h)?))).collect::<Result<Vec<_>>>()?;
+        let sections = if outputs.contains(&"section") { Some(BarModel::load(&weights, "sections")?) } else { None };
+        let keys = if outputs.contains(&"key") { Some(BarModel::load(&weights, "keys")?) } else { None };
+        let mut names: Vec<&str> = Vec::new();
+        for &o in outputs {
+            let needs = match o {
+                "section" => vec!["beat", "melody"],
+                "key" if keys.as_ref().is_some_and(BarModel::needs_chord) => vec!["beat", "melody", "chord"],
+                "key" => vec!["beat", "melody"],
+                head => vec![head],
+            };
+            for n in needs {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+        let heads = names.iter().map(|&h| Ok((h.to_string(), Head::load(&weights, h)?))).collect::<Result<Vec<_>>>()?;
         Ok(Self {
             encoder,
             heads,
+            sections,
+            keys,
             weights,
             #[cfg(feature = "gpu")]
             gpu: None,
         })
     }
 
-    /// As `load`, with the encoder on the GPU.
+    /// Whether the bar models need the block means of the encoder states.
+    fn blocks(&self) -> bool {
+        self.sections.is_some() || self.keys.is_some()
+    }
+
     #[cfg(feature = "gpu")]
-    pub fn load_gpu(path: &std::path::Path, heads: &[&str]) -> Result<Self> {
-        let mut model = Self::load(path, heads)?;
-        model.gpu = Some(gpu::GpuEncoder::load(&model.weights, heads.len())?);
+    pub fn load_gpu(path: &std::path::Path, outputs: &[&str]) -> Result<Self> {
+        let mut model = Self::load(path, outputs)?;
+        let mixes = model.heads.iter().map(|(_, h)| h.mixes.len()).sum::<usize>()
+            + if model.blocks() { bars::GROUPS } else { 0 };
+        model.gpu = Some(gpu::GpuEncoder::load(&model.weights, mixes)?);
         model.weights.release_pages();
         Ok(model)
     }
 
-    /// Apply a LoRA adapter to the encoder from the next song on (`None`: the base weights alone).
     pub fn set_adapter(&mut self, adapter: Option<&lora::Adapter>) -> Result<()> {
         #[cfg(feature = "gpu")]
         if let Some(gpu) = &mut self.gpu {
@@ -81,14 +116,44 @@ impl Model {
 
     /// The heads' logits for a 24 kHz waveform (`beats.frame_outputs`): per head, its outputs over all windows.
     pub fn frame_outputs(&self, wave: &[f32]) -> Result<Vec<(String, Outputs)>> {
+        Ok(self.frames(wave)?.heads)
+    }
+
+    /// The heads' logits for a 24 kHz waveform (`beats.frame_outputs`, `sections.HeadSections.frames`): per head,
+    /// its outputs over all windows, and the block means for the bar models.  A last window too short for the STFT
+    /// (at most `N_FFT / 2` samples) is padded with silence to 1 s and keeps the frames its own samples cover
+    /// (`beats.encode_windows`).
+    pub fn frames(&self, wave: &[f32]) -> Result<Frames> {
         let mut all: Vec<(String, Outputs)> = self.heads.iter().map(|(n, _)| (n.clone(), Vec::new())).collect();
+        let mut states = Vec::new();
         for start in (0..wave.len()).step_by(WINDOW_SAMPLES) {
-            let window = &wave[start..(start + WINDOW_SAMPLES).min(wave.len())];
-            let mut mixes: Vec<Mix> = self.heads.iter().map(|(_, h)| Mix::new(h.mix)).collect();
+            let mut window = &wave[start..(start + WINDOW_SAMPLES).min(wave.len())];
+            let mut keep = None;
+            let padded;
+            if window.len() <= N_FFT / 2 {
+                keep = Some(window.len() / SAMPLES_PER_FRAME);
+                padded = [window, &vec![0.0; SAMPLE_RATE - window.len()]].concat();
+                window = &padded;
+            }
+            let mut mixes: Vec<Mix> =
+                self.heads.iter().flat_map(|(_, h)| h.mixes.iter().map(|m| Mix::new(m))).collect();
+            if self.blocks() {
+                for (lo, hi) in bars::BLOCKS {
+                    let w: Vec<f32> = (0..encoder::STATES)
+                        .map(|l| if (lo..hi).contains(&l) { 1.0 / (hi - lo) as f32 } else { 0.0 })
+                        .collect();
+                    mixes.push(Mix::new(&w));
+                }
+            }
             let frames = self.encode(window, &mut mixes.iter_mut().collect::<Vec<_>>())?;
-            for ((_, head), (mix, (_, outputs))) in self.heads.iter().zip(mixes.iter().zip(all.iter_mut())) {
-                let outs = profile::time("heads", || head.forward(&mix.sum, frames));
-                for (i, (name, width, logits)) in outs.into_iter().enumerate() {
+            let keep = keep.unwrap_or(frames).min(frames);
+            let mut at = 0;
+            for ((_, head), (_, outputs)) in self.heads.iter().zip(all.iter_mut()) {
+                let mixed: Vec<&[f32]> = mixes[at..at + head.mixes.len()].iter().map(|m| m.sum.as_slice()).collect();
+                at += head.mixes.len();
+                let outs = profile::time("heads", || head.forward(&mixed, frames));
+                for (i, (name, width, mut logits)) in outs.into_iter().enumerate() {
+                    logits.truncate(keep * width);
                     if outputs.len() <= i {
                         outputs.push((name, width, logits));
                     } else {
@@ -96,13 +161,21 @@ impl Model {
                     }
                 }
             }
+            if self.blocks() {
+                let groups = &mixes[at..];
+                for t in 0..keep {
+                    for g in groups {
+                        states.extend(
+                            g.sum[t * WIDTH..(t + 1) * WIDTH].iter().map(|&v| half::f16::from_f32(v).to_bits()),
+                        );
+                    }
+                }
+            }
         }
-        Ok(all)
+        Ok(Frames { heads: all, states })
     }
 }
 
-/// Give the memory a request freed back to the system (glibc keeps freed blocks in its per-thread arenas, so a
-/// long-running process would otherwise sit at its peak between requests).
 pub fn release_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {

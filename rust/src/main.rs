@@ -1,10 +1,13 @@
-//! sheetsage2-cpu --weights cpu.safetensors [--adapter LORA] [--threads N] [--out-dir DIR] [--heads beat,melody] [--device cpu|gpu] [--logits]
-//!                [--cpu-heads N] [--tempo-weight W] [--hold P] AUDIO...
+//! sheetsage2-cpu --weights cpu.safetensors [--adapter LORA] [--threads N] [--out-dir DIR]
+//!                [--heads beat,melody,section,key] [--device cpu|gpu] [--logits] [--cpu-heads N] [--tempo-weight W]
+//!                [--hold P] AUDIO...
 //!
-//! Writes `<out-dir>/<stem>.beats.json` and `<stem>.melody.json` as `python -m sheetsage2_refined.beats` / `.melody`
+//! Writes `<out-dir>/<stem>.beats.json`, `<stem>.melody.json`, `<stem>.sections.json` and `<stem>.keys.json` (those
+//! `--heads` names; default `beat,melody`) as `python -m sheetsage2_refined.beats` / `.melody` / `.sections` / `.keys`
 //! do, and with `--logits` also `<stem>.heads.safetensors` with each head's logits (`<head>.<output>`,
-//! `[frames, width]`).  AUDIO may be a WAV / FLAC / MP3 / Ogg file, or a `.f32` file of raw little-endian float32
-//! samples, mono at 24 kHz.  `--adapter` applies a LoRA adapter (`export_cpu --adapter`) to the encoder at run time.
+//! `[frames, width]`) and, for the section and key models, the encoder states' block means (`encoder.states`).
+//! AUDIO may be a WAV / FLAC / MP3 / Ogg file, or a `.f32` file of raw little-endian float32 samples, mono at 24 kHz.
+//! `--adapter` applies a LoRA adapter (`export_cpu --adapter`) to the encoder at run time.
 //! `--cpu-heads N` (with `--device gpu`) computes the last N of the 16 attention heads on the CPU while the GPU
 //! computes the others.
 
@@ -12,11 +15,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use safetensors::tensor::{Dtype, TensorView};
-use sheetsage2_cpu::{MemoryWatch, Model, Outputs, Result, audio, encoder::SAMPLE_RATE, post};
+use sheetsage2_cpu::{Frames, MemoryWatch, Model, Outputs, Result, audio, bars, encoder::SAMPLE_RATE, post};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: sheetsage2-cpu --weights FILE [--adapter LORA] [--threads N] [--out-dir DIR] [--heads beat,melody] [--device cpu|gpu] [--logits] \
+        "usage: sheetsage2-cpu --weights FILE [--adapter LORA] [--threads N] [--out-dir DIR] [--heads beat,melody,section,key] [--device cpu|gpu] [--logits] \
          [--cpu-heads N] [--tempo-weight W] [--hold P] AUDIO..."
     );
     std::process::exit(2)
@@ -30,8 +33,8 @@ fn load_wave(path: &Path) -> Result<Vec<f32>> {
     audio::load(path, SAMPLE_RATE)
 }
 
-/// A `--logits` file back as the heads' outputs, and its duration.
-fn read_logits(path: &Path) -> Result<(Vec<(String, Outputs)>, f64)> {
+/// A `--logits` file back as the heads' outputs and block means, and its duration.
+fn read_logits(path: &Path) -> Result<(Frames, f64)> {
     let bytes = std::fs::read(path)?;
     let (_, meta) = safetensors::SafeTensors::read_metadata(&bytes)?;
     let duration: f64 = meta.metadata().as_ref().and_then(|m| m.get("duration")).ok_or("no duration")?.parse()?;
@@ -39,8 +42,13 @@ fn read_logits(path: &Path) -> Result<(Vec<(String, Outputs)>, f64)> {
     let mut names: Vec<String> = tensors.names().into_iter().map(str::to_string).collect();
     names.sort();
     let mut heads: Vec<(String, Outputs)> = Vec::new();
+    let mut states = Vec::new();
     for key in names {
         let view = tensors.tensor(&key)?;
+        if key == "encoder.states" {
+            states = view.data().chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+            continue;
+        }
         let (head, layer) = key.split_once('.').ok_or("bad tensor name")?;
         let data: Vec<f32> =
             view.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
@@ -50,21 +58,24 @@ fn read_logits(path: &Path) -> Result<(Vec<(String, Outputs)>, f64)> {
             None => heads.push((head.to_string(), vec![(layer.to_string(), width, data)])),
         }
     }
-    Ok((heads, duration))
+    Ok((Frames { heads, states }, duration))
 }
 
-fn write_logits(path: &Path, outputs: &[(String, Outputs)], duration: f64) -> Result<()> {
+fn write_logits(path: &Path, frames: &Frames, duration: f64) -> Result<()> {
     let mut tensors = Vec::new();
-    for (head, outs) in outputs {
+    for (head, outs) in &frames.heads {
         for (name, width, logits) in outs {
             let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
-            tensors.push((format!("{head}.{name}"), vec![logits.len() / width, *width], bytes));
+            tensors.push((format!("{head}.{name}"), Dtype::F32, vec![logits.len() / width, *width], bytes));
         }
     }
-    let views: Vec<(String, TensorView)> = tensors
-        .iter()
-        .map(|(n, s, b)| (n.clone(), TensorView::new(Dtype::F32, s.clone(), b).expect("tensor")))
-        .collect();
+    if !frames.states.is_empty() {
+        let bytes: Vec<u8> = frames.states.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let width = bars::GROUPS * sheetsage2_cpu::encoder::WIDTH;
+        tensors.push(("encoder.states".into(), Dtype::F16, vec![frames.states.len() / width, width], bytes));
+    }
+    let views: Vec<(String, TensorView)> =
+        tensors.iter().map(|(n, d, s, b)| (n.clone(), TensorView::new(*d, s.clone(), b).expect("tensor"))).collect();
     let meta = std::collections::HashMap::from([("duration".to_string(), duration.to_string())]);
     safetensors::serialize_to_file(views, Some(meta), path)?;
     Ok(())
@@ -155,39 +166,65 @@ fn main() -> Result<()> {
     for input in &inputs {
         let watch = MemoryWatch::start();
         let t0 = Instant::now();
-        let (outputs, duration, t1) = if from_logits {
-            let (outputs, duration) = read_logits(input)?;
-            (outputs, duration, Instant::now())
+        let (frames, duration, t1) = if from_logits {
+            let (frames, duration) = read_logits(input)?;
+            (frames, duration, Instant::now())
         } else {
             let wave = load_wave(input)?;
             let t1 = Instant::now();
-            (model.frame_outputs(&wave)?, wave.len() as f64 / SAMPLE_RATE as f64, t1)
+            (model.frames(&wave)?, wave.len() as f64 / SAMPLE_RATE as f64, t1)
         };
         let t2 = Instant::now();
         sheetsage2_cpu::profile::report();
         let stem = input.file_stem().map_or("audio".into(), |s| s.to_string_lossy().to_string());
         let stem = stem.strip_suffix(".heads").map_or(stem.clone(), str::to_string);
         let name = input.to_string_lossy().to_string();
+        let head = |name: &str| frames.heads.iter().find(|(h, _)| h == name).map(|(_, o)| o);
+        let mut results = Vec::new();
+        if let Some(outs) = head("beat") {
+            let probs = post::beat_probs(outs)?;
+            let tracked = sheetsage2_cpu::tracker::track_beats(&probs, &tracker_options, tempo_weight);
+            let result = post::tracked_json(&tracked, &name, duration);
+            if heads.contains(&"section") || heads.contains(&"key") {
+                let melody = head("melody").ok_or("the bar models need the melody head")?;
+                let inputs = bars::FrameInputs::new(melody, head("chord"), &frames.states)?;
+                let beats: Vec<f64> = tracked.beats.iter().map(|&b| post::r4(b)).collect();
+                let downbeats: Vec<f64> = tracked.downbeats.iter().map(|&d| post::r4(d)).collect();
+                let t = Instant::now();
+                if let Some(sections) = &model.sections {
+                    let mut r = result.clone();
+                    r["sections"] = bars::sections_json(sections, &inputs, &beats, &downbeats, duration);
+                    results.push(("sections", r));
+                }
+                if let Some(keys) = &model.keys {
+                    let mut r = result.clone();
+                    r["keys"] = bars::keys_json(keys, &inputs, &beats, &downbeats, duration);
+                    results.push(("keys", r));
+                }
+                sheetsage2_cpu::profile::add("bar models", t.elapsed().as_secs_f64());
+            }
+            if heads.contains(&"beat") {
+                results.insert(0, ("beats", result));
+            }
+        }
+        if let Some(outs) = head("melody").filter(|_| heads.contains(&"melody")) {
+            results.push(("melody", post::melody_json(outs, &name, duration, &decoding)?));
+        }
         let mut written = Vec::new();
-        for (head, outs) in &outputs {
-            let (suffix, result) = match head.as_str() {
-                "beat" => ("beats", post::beats_json(outs, &name, duration, &tracker_options, tempo_weight)?),
-                "melody" => ("melody", post::melody_json(outs, &name, duration, &decoding)?),
-                _ => continue,
-            };
+        for (suffix, result) in results {
             let path = out_dir.join(format!("{stem}.{suffix}.json"));
             std::fs::write(&path, serde_json::to_string(&result)?)?;
             written.push(path);
         }
         if logits && !from_logits {
             let path = out_dir.join(format!("{stem}.heads.safetensors"));
-            write_logits(&path, &outputs, duration)?;
+            write_logits(&path, &frames, duration)?;
             written.push(path);
         }
         sheetsage2_cpu::profile::report();
         let t3 = Instant::now();
         let (anon, file) = watch.stop();
-        drop(outputs);
+        drop(frames);
         sheetsage2_cpu::release_memory();
         if std::env::var_os("SHEETSAGE_PROFILE").is_some() {
             let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
