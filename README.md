@@ -11,6 +11,10 @@ Transcribe whole songs into beats, downbeats and time signatures, melody, chords
 A fine-tuned [SheetSage2](https://huggingface.co/m-a-p/SheetSage2); details and results are on the
 [model card](https://huggingface.co/anime-song/SheetSage2-Refined).
 
+**More accurate chords:** [Tsumugi-Chords](https://github.com/anime-song/Tsumugi-Chords) is a separate chord model
+that reads SheetSage2-Refined's beats and keys (pop test songs: tetrads 0.818 against 0.770 here, slash chords
+0.641 against 0.520).
+
 ## Results
 
 SheetSage2 against SheetSage2-Refined on the same held-out songs; the largest gains are on bars and time
