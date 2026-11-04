@@ -25,7 +25,7 @@
       "section_tracker": {"head": "heads/section-s3.safetensors",  # optional: sections without the decoder (sections.py)
                           "decoding": {"boundary_weight": 8.0, "length_weight": 1.0, "transition_weight": 0.0}},
       "key_tracker": {"head": "heads/key-k10.safetensors",  # optional: keys without the decoder (keys.py)
-                      "decoding": {"local_weight": 2.0, "boundary_weight": 4.0, "mode_tau": 0.5}},
+                      "decoding": {"local_weight": 2.0, "boundary_weight": 4.0, "mode_tau": 0.5, "min_bars": 4}},
       "prompts": ["timestamp", "downbeat_meter", "structure", "key", "chord_detail", "melody_full"],
       "mode_tau": 0.2,                                     # with the key_mode prompt (see ``mode_bias``)
       "mode_counts": [...]                                 # one per theory.MODES

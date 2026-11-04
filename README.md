@@ -31,7 +31,7 @@ key head ([below](#keys-only-no-decoder)) for the keys. The evaluation sets and 
 | Downbeat F, odd-meter songs | 0.733 | 0.835 | **0.883** |
 | Chords (tetrads), pop songs | 0.678 | **0.770** | — |
 | Key, pop songs | 0.825 | 0.911 | **0.934** |
-| Key changes F, pop songs | 0.560 | 0.646 | **0.735** |
+| Key changes F, pop songs | 0.560 | 0.646 | **0.742** |
 | Melody F, HookTheory | 0.664 | 0.682 | **0.713** |
 | Section boundary F (±3 s), HarmonixSet | 0.829 | 0.823 | **0.835** |
 <!-- /tables:summary -->
@@ -162,7 +162,8 @@ result = keys.transcribe("song.mp3")
 result["keys"]   # [{"start": 0.0, "end": 12.18, "key": "F:major", "bars": 8}, {"start": 12.18, ...}, ...]
 ```
 
-Keys change on barlines of the beat tracker.
+Keys change on barlines of the beat tracker, and a key lasts at least 4 bars (`--min-bars`; the first and last key
+of the song may be shorter).
 
 ## License
 

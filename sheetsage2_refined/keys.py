@@ -17,11 +17,14 @@ states, which already carry the surrounding key, and smooths brief changes away)
 
 ``decode`` turns them into key segments with a Viterbi over the bars: a bar's score is its key's log-probability, a
 change costs the boundary's log-probability and staying the log-probability of no boundary (``boundary_weight``).
+With ``min_bars`` > 1 it is a semi-Markov Viterbi over whole segments of at least ``min_bars`` bars (the first and
+the last segment may be shorter): the boundary head often fires on two or three neighbouring bars around one change,
+which the bar Viterbi follows with one-bar back-and-forth keys (E G E G).
 
 A model folder names its key model in ``config.json`` (the file holds the model and its ``config``)::
 
     "key_tracker": {"head": "heads/key-k10.safetensors",
-                    "decoding": {"local_weight": 2.0, "boundary_weight": 4.0, "mode_tau": 0.5}}
+                    "decoding": {"local_weight": 2.0, "boundary_weight": 4.0, "mode_tau": 0.5, "min_bars": 4}}
 
 ``local_weight`` replaces the file's own, ``mode_tau`` adds the decoder's mode bias (``pipeline.mode_bias``, from the
 folder's ``mode_counts``).  ``HeadKeys`` runs the encoder once per window for the beat head, the melody head, the
@@ -201,13 +204,15 @@ def key_inputs(features: dict[str, np.ndarray], section: np.ndarray | None = Non
     return inputs if section is None else inputs | {"bar_section": section.astype(np.float32)}
 
 
-def decode(key_logp: np.ndarray, boundary_p: np.ndarray, boundary_weight: float = 1.0) -> np.ndarray:
+def decode(key_logp: np.ndarray, boundary_p: np.ndarray, boundary_weight: float = 1.0, min_bars: int = 1) -> np.ndarray:
     """The likeliest key per bar (``[bars]`` indices into ``KEYS``) from per-bar key log-probabilities ``[bars, keys]``
-    and change probabilities ``[bars]``."""
+    and change probabilities ``[bars]``; with ``min_bars`` > 1 no key segment but the first and the last is shorter."""
 
     bars, n = key_logp.shape
     p = np.clip(boundary_p, 1e-6, 1 - 1e-6)
     change, stay = boundary_weight * np.log(p), boundary_weight * np.log1p(-p)
+    if min_bars > 1:
+        return decode_segments(key_logp, change, stay, min_bars)
     best = key_logp[0].copy()
     back = np.zeros((bars, n), dtype=np.int64)
     for i in range(1, bars):
@@ -221,6 +226,40 @@ def decode(key_logp: np.ndarray, boundary_p: np.ndarray, boundary_weight: float 
     out[-1] = int(best.argmax())
     for i in range(bars - 1, 0, -1):
         out[i - 1] = back[i][out[i]]
+    return out
+
+
+def decode_segments(key_logp: np.ndarray, change: np.ndarray, stay: np.ndarray, min_bars: int) -> np.ndarray:
+    """``decode``'s semi-Markov Viterbi: segments ``[s, e)`` of one key, each scoring its bars' key log-probabilities,
+    ``stay`` on its bars after the first and ``change`` on its first bar (not the song's); a segment differs from the
+    one before and is at least ``min_bars`` long unless it starts or ends the song."""
+
+    bars, n = key_logp.shape
+    keys = np.arange(n)
+    summed = np.vstack([np.zeros(n), np.cumsum(key_logp, 0)])
+    stayed = np.concatenate([[0.0], np.cumsum(stay)])
+    best = np.full((bars + 1, n), -np.inf)  # best[e, k]: the best decoding of bars [0, e) ending with key k
+    start = np.zeros((bars + 1, n), dtype=np.int64)
+    before = np.full((bars + 1, n), -1)
+    for e in range(1, bars + 1):
+        for s in range(e - 1, -1, -1):
+            if e - s < min_bars and 0 < s and e < bars:
+                continue
+            score = summed[e] - summed[s] + stayed[e] - stayed[s + 1]
+            if s == 0:
+                total, prev = score, np.full(n, -1)
+            else:
+                order = np.argsort(best[s])[::-1][:2]  # the best other key, as in ``decode``
+                prev = np.where(keys == order[0], order[1], order[0])
+                total = best[s][prev] + change[s] + score
+            better = total > best[e]
+            best[e][better], start[e][better], before[e][better] = total[better], s, prev[better]
+    out = np.zeros(bars, dtype=np.int64)
+    e, key = bars, int(best[bars].argmax())
+    while e > 0:
+        s = start[e, key]
+        out[s:e] = key
+        e, key = s, before[e, key]
     return out
 
 
@@ -252,9 +291,10 @@ def load_keys(path: Path, device: str | torch.device = "cpu") -> KeyModel:
 
 class HeadKeys:
     def __init__(self, heads: HeadSections, chord: FrameHead, model: KeyModel, device: torch.device,
-                 boundary_weight: float = 1.0, bias: np.ndarray | None = None):  # fmt: skip
+                 boundary_weight: float = 1.0, bias: np.ndarray | None = None, min_bars: int = 1):  # fmt: skip
         self.heads, self.chord, self.model, self.device = heads, chord, model, device
         self.boundary_weight, self.bias = boundary_weight, bias  # ``decode``'s weight, the per-key mode bias
+        self.min_bars = min_bars  # ``decode``'s shortest key segment
 
     @classmethod
     def load(cls, model: Path | str = DEFAULT_MODEL, device: str | None = None, revision: str | None = None,
@@ -262,7 +302,7 @@ class HeadKeys:
         """The encoder, the beat, melody, chord and key heads of a model folder or Hugging Face repo id (at
         ``revision``; from the Hub only those files are downloaded) on ``device`` (default: CUDA if there is one).
         ``head`` (a key model file) replaces the model's; ``decoding`` (``local_weight``, ``boundary_weight``,
-        ``mode_tau``) goes over the model's ``key_tracker.decoding``."""
+        ``mode_tau``, ``min_bars``) goes over the model's ``key_tracker.decoding``."""
 
         device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         folder = model_folder(model, revision, key_files)
@@ -282,7 +322,7 @@ class HeadKeys:
         per_mode = mode_bias(decoding.get("mode_tau", 0.0), config.get("mode_counts"))
         bias = None if per_mode is None else np.array([per_mode[MODES.index(mode)] for _, mode in KEYS])
         heads = HeadSections(beats, melody, None, None, device)  # for its encoder pass
-        return cls(heads, chord, keys, device, decoding.get("boundary_weight", 1.0), bias)
+        return cls(heads, chord, keys, device, decoding.get("boundary_weight", 1.0), bias, int(decoding.get("min_bars") or 1))
 
     @torch.no_grad()
     def keys(self, frames: dict) -> dict:
@@ -305,7 +345,7 @@ class HeadKeys:
         edges = np.append(bar_start, max(float(frames["duration"]), float(beats[-1])))
         edges[0] = 0.0
         found = []
-        for i, key in enumerate(decode(key_logp, boundary_p, self.boundary_weight)):
+        for i, key in enumerate(decode(key_logp, boundary_p, self.boundary_weight, self.min_bars)):
             if found and found[-1]["key"] == key_name(key):
                 found[-1]["end"], found[-1]["bars"] = round(float(edges[i + 1]), 4), found[-1]["bars"] + 1
             else:
@@ -328,13 +368,14 @@ def main() -> None:
     decoding.add_argument("--local-weight", type=float, help="weight of the local reading")
     decoding.add_argument("--boundary-weight", type=float, help="weight of the key-change probabilities")
     decoding.add_argument("--mode-tau", type=float, help="the mode bias (0: none)")
+    decoding.add_argument("--min-bars", type=int, help="the shortest key segment in bars (1: the bar Viterbi)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", type=Path, default=Path("outputs") / "keys")
     parser.add_argument("--memory-fraction", type=float, default=0.6, help="cap on this process's share of GPU memory")
     args = parser.parse_args()
     if args.device.startswith("cuda"):
         torch.cuda.set_per_process_memory_fraction(args.memory_fraction, torch.device(args.device).index or 0)
-    names = ("local_weight", "boundary_weight", "mode_tau")
+    names = ("local_weight", "boundary_weight", "mode_tau", "min_bars")
     given = {k: getattr(args, k) for k in names if getattr(args, k) is not None}
     tracker = HeadKeys.load(args.model, args.device, args.revision, args.head, **given)
     args.out_dir.mkdir(parents=True, exist_ok=True)
