@@ -11,6 +11,8 @@ pointer written out, with several meters at once.
   for ``local_seconds`` somewhere (mean probability ``local_min``), so a two-bar 3/4 intro still counts.
 * ``p_hold`` > 0 adds a hold state per row and interval, for fermatas (off by default).
 * ``denominators`` writes each tracked bar's denominator from a head's ``bar_unit``, keeping the written tempo.
+* ``refold`` reads runs of bars at double tempo inside the same meter again at the surrounding tempo (a head that
+  hears a bar's eighths as beats, or an inserted 2/4 bar the head does not count as two beats).
 
 Built for ``heads.FrameHead`` outputs at 25 Hz (``beats.HeadBeats``); numba compiles ``viterbi`` on first use
 (cached on disk).
@@ -232,6 +234,44 @@ def apply_offsets(beats: np.ndarray, downbeats: np.ndarray, beat_prob: np.ndarra
     if len(new) and len(downbeats):
         downbeats = new[np.abs(np.asarray(beats)[None] - downbeats[:, None]).argmin(1)]
     return new, downbeats
+
+
+def refold(beats: np.ndarray, downbeats: np.ndarray, low: float = 0.42, high: float = 0.58,
+           context: int = 32) -> tuple[np.ndarray, np.ndarray]:  # fmt: skip
+    """Beats and bar heads with runs of half-length bars read at the surrounding tempo.  A bar is half-length when
+    it lasts ``low``-``high`` times the median of the bars with as many beats within ``context`` bars either side.  A
+    run of them with an even beat count, between full-length bars of that count, loses every other beat; its half
+    bars are merged in pairs, and an odd one left over stays a half bar (a 2/4 bar in 4/4).  The bars before and after
+    keep their bar lines, which a decode that forbade the double tempo would shift by half a bar from there on."""
+
+    beats, downbeats = np.asarray(beats, dtype=np.float64), np.asarray(downbeats, dtype=np.float64)
+    bars = len(downbeats)
+    if bars < 3:
+        return beats, downbeats
+    edges = np.append(downbeats, beats[-1] + 1e-3)
+    inside = [np.flatnonzero((beats >= a - 1e-6) & (beats < b - 1e-6)) for a, b in zip(edges[:-1], edges[1:])]
+    count = np.array([len(i) for i in inside])
+    length = np.diff(edges)
+    half = np.zeros(bars, dtype=bool)
+    for i in range(bars - 1):  # the last bar's length is not known
+        same = [j for j in range(max(0, i - context), min(bars - 1, i + context + 1)) if j != i and count[j] == count[i]]
+        if same:
+            half[i] = low < length[i] / np.median(length[same]) < high
+    keep, merged = np.ones(len(beats), dtype=bool), np.zeros(bars, dtype=bool)
+    i = 0
+    while i < bars - 1:
+        if not half[i]:
+            i += 1
+            continue
+        j = i
+        while j < bars - 1 and half[j] and count[j] == count[i]:
+            j += 1
+        if 0 < i and not half[i - 1] and count[i - 1] == count[i] == count[j] and not half[j] and count[i] % 2 == 0:
+            for k in range(i, j):
+                keep[inside[k][1::2]] = False
+            merged[i + 1 : j : 2] = True
+        i = j
+    return beats[keep], downbeats[~merged]
 
 
 def denominators(beats: np.ndarray, downbeats: np.ndarray, bar_unit: np.ndarray, duration: float,

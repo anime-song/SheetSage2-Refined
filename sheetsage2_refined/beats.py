@@ -96,9 +96,10 @@ def frame_outputs(encoder: MERTEncoder, head: FrameHead | HeadMean, wave: torch.
 
 class HeadBeats:
     def __init__(self, encoder: MERTEncoder, head: FrameHead | HeadMean, device: torch.device, tempo_weight: float = 4.0,
-                 **options):  # fmt: skip
+                 refold: bool = True, **options):  # fmt: skip
         self.encoder, self.head, self.device = encoder, head, device
         self.tempo_weight = tempo_weight  # bar_tracker.denominators: how firmly the written tempo holds
+        self.refold = refold  # bar_tracker.refold: half-length bars read again at the surrounding tempo
         self.options = options  # bar_tracker.track's settings
 
     @classmethod
@@ -108,7 +109,7 @@ class HeadBeats:
         """The encoder and the beat head of a model folder or Hugging Face repo id (at ``revision``; from the Hub only
         those two files are downloaded) on ``device`` (default: CUDA if there is one).  ``weights`` (SheetSage2's
         file) and ``heads`` (bar heads; several: their mean) replace the model's; ``tempo_weight`` goes to
-        ``bar_tracker.denominators``, ``options`` to ``bar_tracker.track``."""
+        ``bar_tracker.denominators``, ``options`` (``refold``, then ``bar_tracker.track``'s settings) to ``__init__``."""
 
         device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         if weights is None or not heads:
@@ -123,7 +124,7 @@ class HeadBeats:
         if len({h.unit is None for h in loaded}) > 1:
             raise ValueError("either all heads predict the denominator or none")
         head = loaded[0] if len(loaded) == 1 else HeadMean(loaded).eval()
-        return cls(load_encoder(weights, device), head, device, **options)
+        return cls(load_encoder(weights, device), head, device, tempo_weight, **options)
 
     def probabilities(self, wave: torch.Tensor) -> dict[str, np.ndarray]:
         """The head's 25 Hz outputs for a 24 kHz waveform (``frame_outputs``): beat, downbeat [frames]; bar_beats,
@@ -139,6 +140,8 @@ class HeadBeats:
         beats, downbeats, metres = bar_tracker.track_head(probs, **self.options)
         if "beat_offset" in probs:
             beats, downbeats = bar_tracker.apply_offsets(beats, downbeats, probs["beat"], probs["beat_offset"])
+        if self.refold:
+            beats, downbeats = bar_tracker.refold(beats, downbeats)
         bars = []
         for i, d in enumerate(downbeats):
             end = downbeats[i + 1] if i + 1 < len(downbeats) else np.inf
@@ -169,6 +172,8 @@ def main() -> None:
     parser.add_argument("--memory-fraction", type=float, default=0.6, help="cap on this process's share of GPU memory")
     parser.add_argument("--threads", type=int, help="CPU threads for torch (default: torch's own)")
     parser.add_argument("--hold", type=float, default=0.0, help="probability of entering a fermata hold (0: off)")
+    parser.add_argument("--no-refold", action="store_true",
+                        help="keep bars at double tempo inside a meter (bar_tracker.refold off)")
     parser.add_argument("--tempo-weight", type=float, default=4.0,
                         help="denominators: cost of a jump in the written tempo (0: the head's own guess per bar)")
     args = parser.parse_args()
@@ -177,7 +182,7 @@ def main() -> None:
     if args.threads:
         torch.set_num_threads(args.threads)
     tracker = HeadBeats.load(args.model, args.head, args.device, args.revision, args.weights,
-                             tempo_weight=args.tempo_weight, p_hold=args.hold)  # fmt: skip
+                             tempo_weight=args.tempo_weight, refold=not args.no_refold, p_hold=args.hold)  # fmt: skip
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for audio in args.audio:
         started = time.perf_counter()

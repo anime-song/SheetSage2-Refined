@@ -27,8 +27,8 @@ key head ([below](#keys-only-no-decoder)) for the keys. The evaluation sets and 
 <!-- tables:summary -->
 |  | SheetSage2 | SheetSage2-Refined | No decoder (beat / melody / section / key heads) |
 |---|---|---|---|
-| Downbeat F, pop songs (mostly 4/4) | 0.966 | 0.965 | **0.976** |
-| Downbeat F, odd-meter songs | 0.733 | 0.835 | **0.883** |
+| Downbeat F, pop songs (mostly 4/4) | 0.966 | 0.965 | **0.978** |
+| Downbeat F, odd-meter songs | 0.733 | 0.835 | **0.884** |
 | Chords (tetrads), pop songs | 0.678 | **0.770** | — |
 | Key, pop songs | 0.825 | 0.911 | **0.934** |
 | Key changes F, pop songs | 0.560 | 0.646 | **0.742** |
@@ -46,13 +46,13 @@ Bars whose two barlines are both found (±70 ms), by time signature, on 50 songs
 | 6/4 | 0.275 | 0.486 | **0.572** |
 | 5/4 | 0.002 | 0.512 | **0.574** |
 | 6/8 | 0.299 | 0.725 | **0.794** |
-| 12/8 | 0.597 | **0.970** | 0.794 |
+| 12/8 | 0.597 | **0.970** | 0.820 |
 | 5/8 | 0.000 | 0.008 | **0.508** |
 | 11/8 | 0.000 | **0.586** | 0.563 |
 | 2/4 | 0.063 | **0.111** | 0.079 |
 | 7/8 | 0.000 | 0.305 | **0.847** |
 | 7/4 | 0.000 | 0.196 | **0.565** |
-| **all** | 0.534 | 0.661 | **0.752** |
+| **all** | 0.534 | 0.661 | **0.754** |
 <!-- /tables:summary-meters -->
 
 ## Install
@@ -100,7 +100,10 @@ result["bars"]                          # [{"start": 1.42, "beats": 7, "unit": 8
 ```
 
 Each bar's denominator is chosen so that the written tempo does not jump: the same beat keeps its denominator,
-and a 7-beat bar after 4/4 at twice the beat speed is written 7/8, not 7/4.
+and a 7-beat bar after 4/4 at twice the beat speed is written 7/8, not 7/4.  Bars that come out at double tempo
+inside the same meter are read again at the surrounding tempo (since 0.5.2; `--no-refold` turns it off): swing songs
+no longer flip to double tempo for a bar where the head counts straight eighths as beats, and a 2/4 bar inserted
+in 4/4 is written 2/4.
 
 ### Melody only (no decoder)
 
