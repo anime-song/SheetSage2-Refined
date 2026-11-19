@@ -15,6 +15,9 @@ A fine-tuned [SheetSage2](https://huggingface.co/m-a-p/SheetSage2); details and 
 that reads SheetSage2-Refined's beats and keys (pop test songs: tetrads 0.818 against 0.770 here, slash chords
 0.641 against 0.520).
 
+**Genres:** [Tsumugi-Genres](https://github.com/anime-song/Tsumugi-Genres) is a genre model (135 genres, several per
+song) on SheetSage2-Refined's frozen encoder.
+
 ## Results
 
 SheetSage2 against SheetSage2-Refined on the same held-out songs; the largest gains are on bars and time
